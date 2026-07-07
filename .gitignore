@@ -17,6 +17,7 @@ env/
 .env
 .env.*
 !.env.example
+peoplebooks.toml
 
 # Tool caches
 .pytest_cache/

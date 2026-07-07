@@ -1,0 +1,5 @@
+[settings]
+database_url = "postgresql://peoplebooks:peoplebooks@localhost:5432/peoplebooks"
+user_agent = "PeopleBooksMCP/0.1.0"
+request_timeout_seconds = 20
+

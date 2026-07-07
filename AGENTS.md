@@ -19,6 +19,8 @@
 
 - Python 3.14.
 - `uv` for project and dependency management.
+- Project metadata and tool defaults live in `pyproject.toml`.
+- Python package: `src/peoplebooks_mcp`.
 - Local PostgreSQL from day one.
 - `httpx` for HTTP-first fetching.
 - BeautifulSoup plus `lxml` for parsing.
@@ -29,6 +31,7 @@
 
 ## Scraper
 
+- Default seed config lives in `peoplebooks_mcp.config`; local overrides use `peoplebooks.toml` or `PEOPLEBOOKS_*` env vars.
 - Use conservative requests: low concurrency, delay, timeout, retries, backoff, and project user agent.
 - Do not enforce `robots.txt`.
 - Store raw HTML, normalized URL, source metadata, content hash, parser version, fetch status, and timestamps.

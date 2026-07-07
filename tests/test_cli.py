@@ -4,6 +4,7 @@ from peoplebooks_mcp.cli import app
 from peoplebooks_mcp.config import AppConfig, BookSeed, DocVersionSeed, RuntimeSettings
 from peoplebooks_mcp.repositories import StatusCounts
 from peoplebooks_mcp.scraper.discovery import DiscoveryResult
+from peoplebooks_mcp.scraper.scrape import ReparseResult, ScrapeResult
 
 
 def test_cli_help_lists_planned_commands() -> None:
@@ -93,6 +94,75 @@ def test_status_command_prints_lifecycle_counts(monkeypatch) -> None:
     assert "discovered: 4" in result.output
     assert "queued: 1" in result.output
     assert "indexed: 0" in result.output
+
+
+def test_scrape_command_runs_configured_scrape(monkeypatch) -> None:
+    calls = []
+
+    class FakeRepository:
+        pass
+
+    class FakeRepositoryContext:
+        def __enter__(self) -> FakeRepository:
+            return FakeRepository()
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+    def fake_scrape_pages(**kwargs) -> ScrapeResult:
+        calls.append(kwargs)
+        return ScrapeResult(scraped=2, failed=1, parsed=2)
+
+    monkeypatch.setattr("peoplebooks_mcp.cli.load_config", _test_config)
+    monkeypatch.setattr(
+        "peoplebooks_mcp.cli.PeopleBooksRepository.connect",
+        lambda database_url: FakeRepositoryContext(),
+    )
+    monkeypatch.setattr("peoplebooks_mcp.cli.scrape_pages", fake_scrape_pages)
+
+    result = CliRunner().invoke(app, ["scrape", "--limit", "3"])
+
+    assert result.exit_code == 0
+    assert "Scraped 2 pages" in result.output
+    assert "failed 1" in result.output
+    assert "parsed 2" in result.output
+    assert calls[0]["version_code"] == "pt862"
+    assert calls[0]["limit"] == 3
+
+
+def test_reparse_command_runs_configured_reparse(monkeypatch) -> None:
+    calls = []
+
+    class FakeRepository:
+        pass
+
+    class FakeRepositoryContext:
+        def __enter__(self) -> FakeRepository:
+            return FakeRepository()
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+    def fake_reparse_pages(**kwargs) -> ReparseResult:
+        calls.append(kwargs)
+        return ReparseResult(reparsed=4)
+
+    monkeypatch.setattr("peoplebooks_mcp.cli.load_config", _test_config)
+    monkeypatch.setattr(
+        "peoplebooks_mcp.cli.PeopleBooksRepository.connect",
+        lambda database_url: FakeRepositoryContext(),
+    )
+    monkeypatch.setattr("peoplebooks_mcp.cli.reparse_pages", fake_reparse_pages)
+
+    result = CliRunner().invoke(
+        app,
+        ["reparse", "--parser-version", "parser-v2"],
+    )
+
+    assert result.exit_code == 0
+    assert "Reparsed 4 pages" in result.output
+    assert calls[0]["version_code"] == "pt862"
+    assert calls[0]["parser_version"] == "parser-v2"
 
 
 def _test_config() -> AppConfig:

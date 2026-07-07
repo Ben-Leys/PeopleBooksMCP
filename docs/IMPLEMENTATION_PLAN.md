@@ -24,6 +24,7 @@
 - Implement a conservative `httpx` fetcher with project user agent, low concurrency, delay, timeout, retries, and backoff.
 - Do not enforce `robots.txt`.
 - Implement `peoplebooks discover --version pt862 --book tpcr` to load the seed home/book navigation and queue pages in PostgreSQL.
+- Current Phase 3 discovery uses the configured `tpcr` seed as a bootstrap and does not persist the higher-level Oracle home hierarchy above the book.
 - Implement `peoplebooks status --version pt862` for discovered, queued, fetched, failed, parsed, and indexed counts.
 - Tests: fixture parser tests for home/book HTML, mocked retry/backoff/timeout/hash/failure recording tests, and CLI discovery/status tests.
 
@@ -56,3 +57,11 @@
 - Add concise README usage for local PostgreSQL setup, `uv` commands, CLI commands, and MCP startup.
 - Update `AGENTS.md` whenever implementation details, dependencies, schema, CLI, MCP behavior, or architecture differ from the current instructions.
 - Final tests: full pytest suite, CLI smoke run, database migration check, and MCP smoke test.
+
+## Later: Full Products Tree Discovery
+
+- Discover books by parsing the whole Oracle home `Products` tree instead of adding one seed URL per book.
+- Persist intermediate navigation/category nodes from the actual Oracle tree, such as `Products` and the product-area/category nodes above each book.
+- Treat PeopleCode API Reference (`tpcr`) as one discovered book in that tree; do not overwrite, duplicate, or special-case it when broad discovery is added.
+- Preserve stable book codes and existing page identities when migrating from seed-only discovery to full-tree discovery.
+- Tests: fixture coverage for nested home navigation, multiple discovered books, category parent chains, idempotent reruns, and preserving existing `tpcr` data.

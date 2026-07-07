@@ -6,6 +6,7 @@ from peoplebooks_mcp.config import load_config
 from peoplebooks_mcp.repositories import PeopleBooksRepository
 from peoplebooks_mcp.scraper.discovery import DiscoveryError, discover_book
 from peoplebooks_mcp.scraper.fetcher import FetchError, PeopleBooksFetcher
+from peoplebooks_mcp.scraper.scrape import reparse_pages, scrape_pages
 
 app = typer.Typer(
     help="Scrape Oracle PeopleBooks into PostgreSQL and serve read-only MCP docs.",
@@ -64,7 +65,24 @@ def scrape(
     """Fetch queued PeopleBooks pages into PostgreSQL."""
     if not version or limit < 1:
         raise typer.Exit(code=2)
-    _not_implemented("scrape")
+    config = load_config()
+    fetcher = PeopleBooksFetcher(
+        user_agent=config.settings.user_agent,
+        timeout_seconds=config.settings.request_timeout_seconds,
+    )
+    try:
+        with PeopleBooksRepository.connect(config.settings.database_url) as repository:
+            result = scrape_pages(
+                repository=repository,
+                version_code=version,
+                fetcher=fetcher,
+                limit=limit,
+            )
+    except ValueError as error:
+        typer.echo(str(error))
+        raise typer.Exit(code=2) from error
+
+    typer.echo(f"Scraped {result.scraped} pages; failed {result.failed}; parsed {result.parsed}.")
 
 
 @app.command()
@@ -98,7 +116,19 @@ def reparse(
     """Rebuild parsed sections and chunks from stored raw HTML."""
     if not version or not parser_version:
         raise typer.Exit(code=2)
-    _not_implemented("reparse")
+    config = load_config()
+    try:
+        with PeopleBooksRepository.connect(config.settings.database_url) as repository:
+            result = reparse_pages(
+                repository=repository,
+                version_code=version,
+                parser_version=parser_version,
+            )
+    except ValueError as error:
+        typer.echo(str(error))
+        raise typer.Exit(code=2) from error
+
+    typer.echo(f"Reparsed {result.reparsed} pages.")
 
 
 @app.command()

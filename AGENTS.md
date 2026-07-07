@@ -38,6 +38,9 @@
 - Store raw HTML, normalized URL, source metadata, content hash, parser version, fetch status, and timestamps.
 - Keep discovered pages and scrape state in PostgreSQL.
 - Discovery parses home/book navigation, queues book page links, and stores normalized Oracle URLs.
+- Current discovery bootstraps `tpcr` from config and does not yet persist higher-level Oracle `Products` category nodes.
+- Future discovery should parse the whole `Products` tree and discover all books from it instead of adding one seed URL per book.
+- When full-tree discovery is added, keep existing `tpcr` data as the discovered PeopleCode API Reference book; do not overwrite or duplicate it.
 - Fetching uses `peoplebooks_mcp.scraper.fetcher.PeopleBooksFetcher`.
 - `scrape --limit N` processes the next eligible pages and resumes after interruption.
 - Support reparse from stored raw HTML without refetching Oracle.
@@ -46,8 +49,9 @@
 
 - Core tables: `doc_versions`, `books`, `nav_nodes`, `pages`, `sections`, `chunks`, `fetch_events`.
 - Page uniqueness includes `doc_version_id` and normalized path or URL.
+- `nav_nodes` should eventually store full Oracle category/book/page parent chains from the `Products` tree.
 - Parse leaf pages into H1/H2/H3 sections and retrieval chunks.
-- Full-text vectors on chunks are planned for Phase 5; Phase 2 stores chunk text and metadata.
+- Full-text vectors on chunks are planned for Phase 5; Phase 4 stores chunk text and metadata.
 - Keep fetch diagnostics append-only.
 - PostgreSQL repository entry point: `peoplebooks_mcp.repositories.PeopleBooksRepository`.
 
@@ -59,7 +63,7 @@
 - `peoplebooks reparse --version pt862 --parser-version X`.
 - `peoplebooks index --version pt862`.
 - `peoplebooks serve-mcp`.
-- `scrape`, `reparse`, `index`, and `serve-mcp` remain Typer stubs until their implementation phases.
+- `index` and `serve-mcp` remain Typer stubs until their implementation phases.
 
 ## MCP
 

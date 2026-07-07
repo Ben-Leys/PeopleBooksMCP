@@ -373,6 +373,36 @@ class PeopleBooksRepository:
         ).fetchall()
         return [_record(PageRecord, row) for row in rows]
 
+    def list_next_scrape_pages(self, *, doc_version_id: int, limit: int) -> list[PageRecord]:
+        rows = self._connection.execute(
+            """
+            SELECT *
+            FROM pages
+            WHERE doc_version_id = %s
+              AND (
+                fetch_status = 'queued'
+                OR (fetch_status = 'fetched' AND raw_html IS NOT NULL)
+              )
+            ORDER BY queued_at, id
+            LIMIT %s
+            """,
+            (doc_version_id, limit),
+        ).fetchall()
+        return [_record(PageRecord, row) for row in rows]
+
+    def list_pages_with_raw_html(self, *, doc_version_id: int) -> list[PageRecord]:
+        rows = self._connection.execute(
+            """
+            SELECT *
+            FROM pages
+            WHERE doc_version_id = %s
+              AND raw_html IS NOT NULL
+            ORDER BY id
+            """,
+            (doc_version_id,),
+        ).fetchall()
+        return [_record(PageRecord, row) for row in rows]
+
     def get_status_counts(self, *, doc_version_id: int) -> StatusCounts:
         rows = self._connection.execute(
             """

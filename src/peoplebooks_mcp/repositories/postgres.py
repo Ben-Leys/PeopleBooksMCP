@@ -105,6 +105,7 @@ class ChunkRecord:
     ordinal: int
     content: str
     metadata: JsonObject
+    search_vector: str | None
     created_at: datetime
     updated_at: datetime
 
@@ -132,6 +133,26 @@ class StatusCounts:
     failed: int
     parsed: int
     indexed: int
+
+
+@dataclass(frozen=True, slots=True)
+class SearchResultRecord:
+    version_code: str
+    version_label: str
+    book_code: str
+    book_title: str
+    page_id: int
+    page_title: str | None
+    normalized_path: str
+    source_url: str
+    section_id: int
+    section_stable_id: str
+    section_heading: str
+    section_path: list[str]
+    chunk_id: int
+    chunk_stable_id: str
+    snippet: str
+    rank: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -652,6 +673,7 @@ class PeopleBooksRepository:
                 SET fetch_status = 'parsed',
                     parser_version = %s,
                     parsed_at = now(),
+                    indexed_at = NULL,
                     updated_at = now()
                 WHERE id = %s
                 """,
@@ -681,6 +703,101 @@ class PeopleBooksRepository:
             (page_id,),
         ).fetchall()
         return [_record(ChunkRecord, row) for row in rows]
+
+    def refresh_chunk_search_vectors(self, *, doc_version_id: int) -> int:
+        cursor = self._connection.execute(
+            """
+            UPDATE chunks AS c
+            SET search_vector =
+                    setweight(to_tsvector('english', coalesce(p.title, '')), 'A')
+                    || setweight(
+                        to_tsvector('english', coalesce(array_to_string(s.section_path, ' '), '')),
+                        'A'
+                    )
+                    || setweight(to_tsvector('english', coalesce(s.heading, '')), 'A')
+                    || setweight(to_tsvector('english', coalesce(c.content, '')), 'B'),
+                updated_at = now()
+            FROM pages AS p, sections AS s
+            WHERE c.page_id = p.id
+              AND c.section_id = s.id
+              AND p.doc_version_id = %s
+            """,
+            (doc_version_id,),
+        )
+        return cursor.rowcount
+
+    def mark_pages_indexed(self, *, doc_version_id: int) -> int:
+        cursor = self._connection.execute(
+            """
+            UPDATE pages AS p
+            SET fetch_status = 'indexed',
+                indexed_at = now(),
+                updated_at = now()
+            WHERE p.doc_version_id = %s
+              AND p.fetch_status IN ('parsed', 'indexed')
+              AND EXISTS (
+                SELECT 1
+                FROM chunks AS c
+                WHERE c.page_id = p.id
+                  AND c.search_vector IS NOT NULL
+              )
+            """,
+            (doc_version_id,),
+        )
+        return cursor.rowcount
+
+    def search_chunks(
+        self,
+        *,
+        doc_version_id: int,
+        query: str,
+        limit: int = 10,
+    ) -> list[SearchResultRecord]:
+        search_text = query.strip()
+        if not search_text or limit < 1:
+            return []
+
+        rows = self._connection.execute(
+            """
+            WITH search_query AS (
+                SELECT websearch_to_tsquery('english', %s) AS query
+            )
+            SELECT
+                dv.code AS version_code,
+                dv.label AS version_label,
+                b.code AS book_code,
+                b.title AS book_title,
+                p.id AS page_id,
+                p.title AS page_title,
+                p.normalized_path AS normalized_path,
+                p.source_url AS source_url,
+                s.id AS section_id,
+                s.stable_id AS section_stable_id,
+                s.heading AS section_heading,
+                s.section_path AS section_path,
+                c.id AS chunk_id,
+                c.stable_id AS chunk_stable_id,
+                ts_headline(
+                    'english',
+                    c.content,
+                    search_query.query,
+                    'StartSel=<mark>, StopSel=</mark>, MaxWords=35, MinWords=8, ShortWord=3'
+                ) AS snippet,
+                ts_rank_cd(c.search_vector, search_query.query)::float8 AS rank
+            FROM chunks AS c
+            JOIN pages AS p ON p.id = c.page_id
+            JOIN books AS b ON b.id = p.book_id
+            JOIN doc_versions AS dv ON dv.id = p.doc_version_id
+            JOIN sections AS s ON s.id = c.section_id
+            CROSS JOIN search_query
+            WHERE p.doc_version_id = %s
+              AND c.search_vector @@ search_query.query
+            ORDER BY rank DESC, p.id, s.ordinal, c.ordinal, c.id
+            LIMIT %s
+            """,
+            (search_text, doc_version_id, limit),
+        ).fetchall()
+        return [_record(SearchResultRecord, row) for row in rows]
 
     def _find_page_by_unique_key(
         self,

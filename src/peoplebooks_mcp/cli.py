@@ -3,6 +3,7 @@ from typing import Annotated
 import typer
 
 from peoplebooks_mcp.config import load_config
+from peoplebooks_mcp.indexing import index_pages
 from peoplebooks_mcp.repositories import PeopleBooksRepository
 from peoplebooks_mcp.scraper.discovery import DiscoveryError, discover_book
 from peoplebooks_mcp.scraper.fetcher import FetchError, PeopleBooksFetcher
@@ -138,7 +139,15 @@ def index(
     """Populate PostgreSQL full-text search vectors."""
     if not version:
         raise typer.Exit(code=2)
-    _not_implemented("index")
+    config = load_config()
+    try:
+        with PeopleBooksRepository.connect(config.settings.database_url) as repository:
+            result = index_pages(repository=repository, version_code=version)
+    except ValueError as error:
+        typer.echo(str(error))
+        raise typer.Exit(code=2) from error
+
+    typer.echo(f"Indexed {result.indexed_chunks} chunks across {result.indexed_pages} pages.")
 
 
 @app.command(name="serve-mcp")

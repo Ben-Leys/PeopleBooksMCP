@@ -51,7 +51,9 @@
 - Page uniqueness includes `doc_version_id` and normalized path or URL.
 - `nav_nodes` should eventually store full Oracle category/book/page parent chains from the `Products` tree.
 - Parse leaf pages into H1/H2/H3 sections and retrieval chunks.
-- Full-text vectors on chunks are planned for Phase 5; Phase 4 stores chunk text and metadata.
+- Full-text vectors on chunks are stored in `chunks.search_vector` and indexed with GIN.
+- `peoplebooks_mcp.indexing.index_pages` refreshes chunk vectors and marks indexed pages.
+- Repository search returns version, book, page, section path, source URL, snippets, rank, and stable section/chunk IDs.
 - Keep fetch diagnostics append-only.
 - PostgreSQL repository entry point: `peoplebooks_mcp.repositories.PeopleBooksRepository`.
 
@@ -61,9 +63,9 @@
 - `peoplebooks scrape --version pt862 --limit 25`.
 - `peoplebooks status --version pt862` prints discovered, queued, fetched, failed, parsed, and indexed counts.
 - `peoplebooks reparse --version pt862 --parser-version X`.
-- `peoplebooks index --version pt862`.
+- `peoplebooks index --version pt862` refreshes PostgreSQL full-text vectors for parsed chunks.
 - `peoplebooks serve-mcp`.
-- `index` and `serve-mcp` remain Typer stubs until their implementation phases.
+- `serve-mcp` remains a Typer stub until its implementation phase.
 
 ## MCP
 

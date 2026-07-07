@@ -2,6 +2,7 @@ from typer.testing import CliRunner
 
 from peoplebooks_mcp.cli import app
 from peoplebooks_mcp.config import AppConfig, BookSeed, DocVersionSeed, RuntimeSettings
+from peoplebooks_mcp.indexing import IndexResult
 from peoplebooks_mcp.repositories import StatusCounts
 from peoplebooks_mcp.scraper.discovery import DiscoveryResult
 from peoplebooks_mcp.scraper.scrape import ReparseResult, ScrapeResult
@@ -163,6 +164,37 @@ def test_reparse_command_runs_configured_reparse(monkeypatch) -> None:
     assert "Reparsed 4 pages" in result.output
     assert calls[0]["version_code"] == "pt862"
     assert calls[0]["parser_version"] == "parser-v2"
+
+
+def test_index_command_runs_configured_index(monkeypatch) -> None:
+    calls = []
+
+    class FakeRepository:
+        pass
+
+    class FakeRepositoryContext:
+        def __enter__(self) -> FakeRepository:
+            return FakeRepository()
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+    def fake_index_pages(**kwargs) -> IndexResult:
+        calls.append(kwargs)
+        return IndexResult(indexed_chunks=3, indexed_pages=2)
+
+    monkeypatch.setattr("peoplebooks_mcp.cli.load_config", _test_config)
+    monkeypatch.setattr(
+        "peoplebooks_mcp.cli.PeopleBooksRepository.connect",
+        lambda database_url: FakeRepositoryContext(),
+    )
+    monkeypatch.setattr("peoplebooks_mcp.cli.index_pages", fake_index_pages)
+
+    result = CliRunner().invoke(app, ["index"])
+
+    assert result.exit_code == 0
+    assert "Indexed 3 chunks across 2 pages." in result.output
+    assert calls[0]["version_code"] == "pt862"
 
 
 def _test_config() -> AppConfig:

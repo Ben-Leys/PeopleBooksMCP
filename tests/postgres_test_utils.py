@@ -64,6 +64,20 @@ def column_names(database_url: str, table_name: str) -> set[str]:
     return {row[0] for row in rows}
 
 
+def index_names(database_url: str, table_name: str) -> set[str]:
+    with psycopg.connect(database_url) as connection:
+        rows = connection.execute(
+            """
+            SELECT indexname
+            FROM pg_indexes
+            WHERE schemaname = 'public'
+              AND tablename = %s
+            """,
+            (table_name,),
+        ).fetchall()
+    return {row[0] for row in rows}
+
+
 def constraint_names(database_url: str, table_name: str) -> set[str]:
     with psycopg.connect(database_url) as connection:
         rows = connection.execute(

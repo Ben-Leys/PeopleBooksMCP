@@ -4,7 +4,7 @@ import psycopg
 import pytest
 
 from peoplebooks_mcp.database import run_migrations
-from tests.postgres_test_utils import column_names, constraint_names, table_names
+from tests.postgres_test_utils import column_names, constraint_names, index_names, table_names
 
 
 def test_migrations_create_phase_2_tables_and_columns(postgres_url: str) -> None:
@@ -40,6 +40,13 @@ def test_migrations_create_phase_2_tables_and_columns(postgres_url: str) -> None
     page_constraints = constraint_names(postgres_url, "pages")
     assert "uq_pages_doc_version_normalized_url" in page_constraints
     assert "uq_pages_doc_version_normalized_path" in page_constraints
+
+
+def test_migrations_create_phase_5_chunk_search_vector_and_index(postgres_url: str) -> None:
+    run_migrations(postgres_url)
+
+    assert "search_vector" in column_names(postgres_url, "chunks")
+    assert "ix_chunks_search_vector" in index_names(postgres_url, "chunks")
 
 
 def test_fetch_events_are_append_only(postgres_url: str) -> None:

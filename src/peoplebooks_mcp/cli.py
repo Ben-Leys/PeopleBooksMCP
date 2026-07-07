@@ -4,6 +4,7 @@ import typer
 
 from peoplebooks_mcp.config import load_config
 from peoplebooks_mcp.indexing import index_pages
+from peoplebooks_mcp.mcp_server import create_server
 from peoplebooks_mcp.repositories import PeopleBooksRepository
 from peoplebooks_mcp.scraper.discovery import (
     DiscoveryError,
@@ -229,4 +230,5 @@ def index(
 @app.command(name="serve-mcp")
 def serve_mcp() -> None:
     """Start the read-only MCP server."""
-    _not_implemented("serve-mcp")
+    config = load_config()
+    create_server(database_url=config.settings.database_url).run()

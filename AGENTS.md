@@ -68,16 +68,15 @@
 - `peoplebooks reparse --version pt862 --parser-version X`.
 - `peoplebooks index --version pt862` refreshes PostgreSQL full-text vectors for parsed chunks.
 - `peoplebooks serve-mcp`.
-- `serve-mcp` remains a Typer stub until its implementation phase.
+- `serve-mcp` starts the read-only MCP server over stdio.
 
 ## MCP
 
-- MCP server behavior is planned for Phase 6; current module is a stub.
 - MCP must be read-only until explicitly changed.
 - MCP handlers must never scrape live Oracle pages.
-- Planned tools: `search_docs`, `get_page`, `get_section`, `list_books`.
-- Planned resources: versions, books, pages, sections.
-- Planned results include version, book, page, section path, source URL, snippet, and stable IDs.
+- MCP tools: `search_docs`, `get_page`, `get_section`, `list_books`.
+- MCP resources expose versions, version books, book pages, pages, and sections.
+- MCP results include version, book, page, section path, source URL, source metadata, snippet, and stable IDs.
 
 ## Testing
 

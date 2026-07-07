@@ -1,9 +1,512 @@
 from __future__ import annotations
 
+import json
+from collections.abc import Sequence
+from datetime import datetime
 from typing import Any
 
+from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
-def create_server() -> Any:
-    from mcp.server.fastmcp import FastMCP
+from peoplebooks_mcp.config import load_config
+from peoplebooks_mcp.repositories import (
+    BookRecord,
+    ChunkRecord,
+    DocVersionRecord,
+    PageRecord,
+    PeopleBooksRepository,
+    SearchResultRecord,
+    SectionRecord,
+)
 
-    return FastMCP("peoplebooks-mcp")
+JsonObject = dict[str, Any]
+
+DEFAULT_VERSION = "pt862"
+JSON_MIME_TYPE = "application/json"
+
+
+def create_server(*, database_url: str | None = None) -> FastMCP:
+    resolved_database_url = database_url or load_config().settings.database_url
+    server = FastMCP(
+        "peoplebooks-mcp",
+        instructions=(
+            "Read-only Oracle PeopleBooks documentation server backed by local PostgreSQL. "
+            "Handlers search and read indexed database content only."
+        ),
+    )
+    read_only = ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+
+    @server.tool(
+        annotations=read_only,
+        structured_output=True,
+    )
+    def search_docs(
+        query: str,
+        version: str = DEFAULT_VERSION,
+        limit: int = 10,
+    ) -> JsonObject:
+        """Search indexed PeopleBooks chunks."""
+        with PeopleBooksRepository.connect(resolved_database_url) as repository:
+            doc_version = _require_doc_version(repository, version)
+            results = repository.search_chunks(
+                doc_version_id=doc_version.id,
+                query=query,
+                limit=_bounded_limit(limit),
+            )
+        return {
+            "query": query,
+            "version": _doc_version_payload(doc_version),
+            "results": [_search_result_payload(result) for result in results],
+        }
+
+    @server.tool(
+        annotations=read_only,
+        structured_output=True,
+    )
+    def get_page(
+        version: str = DEFAULT_VERSION,
+        page_id: int | None = None,
+        normalized_path: str | None = None,
+    ) -> JsonObject:
+        """Read a parsed page by database id or normalized Oracle path."""
+        with PeopleBooksRepository.connect(resolved_database_url) as repository:
+            doc_version = _require_doc_version(repository, version)
+            page = _resolve_page(
+                repository,
+                doc_version=doc_version,
+                page_id=page_id,
+                normalized_path=normalized_path,
+            )
+            return _page_detail_payload(repository, page)
+
+    @server.tool(
+        annotations=read_only,
+        structured_output=True,
+    )
+    def get_section(
+        version: str = DEFAULT_VERSION,
+        section_id: int | None = None,
+        section_stable_id: str | None = None,
+        page_id: int | None = None,
+        normalized_path: str | None = None,
+    ) -> JsonObject:
+        """Read a parsed section by id or by page plus stable section id."""
+        with PeopleBooksRepository.connect(resolved_database_url) as repository:
+            doc_version = _require_doc_version(repository, version)
+            section = _resolve_section(
+                repository,
+                doc_version=doc_version,
+                section_id=section_id,
+                section_stable_id=section_stable_id,
+                page_id=page_id,
+                normalized_path=normalized_path,
+            )
+            return _section_detail_payload(repository, section)
+
+    @server.tool(
+        annotations=read_only,
+        structured_output=True,
+    )
+    def list_books(version: str = DEFAULT_VERSION) -> JsonObject:
+        """List discovered books for a PeopleBooks version."""
+        with PeopleBooksRepository.connect(resolved_database_url) as repository:
+            doc_version = _require_doc_version(repository, version)
+            books = repository.list_books(doc_version_id=doc_version.id)
+        return {
+            "version": _doc_version_payload(doc_version),
+            "books": [_book_payload(book) for book in books],
+        }
+
+    @server.resource(
+        "peoplebooks://versions",
+        name="peoplebooks_versions",
+        title="PeopleBooks Versions",
+        description="List discovered PeopleBooks documentation versions.",
+        mime_type=JSON_MIME_TYPE,
+    )
+    def versions_resource() -> str:
+        with PeopleBooksRepository.connect(resolved_database_url) as repository:
+            versions = repository.list_doc_versions()
+        return _json({"versions": [_doc_version_payload(version) for version in versions]})
+
+    @server.resource(
+        "peoplebooks://versions/{version_code}",
+        name="peoplebooks_version",
+        title="PeopleBooks Version",
+        description="Read one discovered PeopleBooks documentation version.",
+        mime_type=JSON_MIME_TYPE,
+    )
+    def version_resource(version_code: str) -> str:
+        with PeopleBooksRepository.connect(resolved_database_url) as repository:
+            version = _require_doc_version(repository, version_code)
+            books = repository.list_books(doc_version_id=version.id)
+        return _json(
+            {
+                "version": _doc_version_payload(version),
+                "books": [_book_payload(book) for book in books],
+            }
+        )
+
+    @server.resource(
+        "peoplebooks://versions/{version_code}/books",
+        name="peoplebooks_books",
+        title="PeopleBooks Books",
+        description="List discovered books for a PeopleBooks version.",
+        mime_type=JSON_MIME_TYPE,
+    )
+    def books_resource(version_code: str) -> str:
+        with PeopleBooksRepository.connect(resolved_database_url) as repository:
+            version = _require_doc_version(repository, version_code)
+            books = repository.list_books(doc_version_id=version.id)
+        return _json(
+            {
+                "version": _doc_version_payload(version),
+                "books": [_book_payload(book) for book in books],
+            }
+        )
+
+    @server.resource(
+        "peoplebooks://versions/{version_code}/books/{book_code}/pages",
+        name="peoplebooks_pages",
+        title="PeopleBooks Pages",
+        description="List discovered pages for a PeopleBooks book.",
+        mime_type=JSON_MIME_TYPE,
+    )
+    def pages_resource(version_code: str, book_code: str) -> str:
+        with PeopleBooksRepository.connect(resolved_database_url) as repository:
+            version = _require_doc_version(repository, version_code)
+            book = _require_book(repository, doc_version_id=version.id, code=book_code)
+            pages = repository.list_pages_for_book(doc_version_id=version.id, book_id=book.id)
+        return _json(
+            {
+                "version": _doc_version_payload(version),
+                "book": _book_payload(book),
+                "pages": [_page_payload(page) for page in pages],
+            }
+        )
+
+    @server.resource(
+        "peoplebooks://pages/{page_id}",
+        name="peoplebooks_page",
+        title="PeopleBooks Page",
+        description="Read one parsed PeopleBooks page.",
+        mime_type=JSON_MIME_TYPE,
+    )
+    def page_resource(page_id: int) -> str:
+        with PeopleBooksRepository.connect(resolved_database_url) as repository:
+            page = _require_page_by_id(repository, page_id)
+            return _json(_page_detail_payload(repository, page))
+
+    @server.resource(
+        "peoplebooks://sections/{section_id}",
+        name="peoplebooks_section",
+        title="PeopleBooks Section",
+        description="Read one parsed PeopleBooks section.",
+        mime_type=JSON_MIME_TYPE,
+    )
+    def section_resource(section_id: int) -> str:
+        with PeopleBooksRepository.connect(resolved_database_url) as repository:
+            section = _require_section_by_id(repository, section_id)
+            return _json(_section_detail_payload(repository, section))
+
+    return server
+
+
+def _require_doc_version(
+    repository: PeopleBooksRepository,
+    code: str,
+) -> DocVersionRecord:
+    doc_version = repository.get_doc_version_by_code(code)
+    if doc_version is None:
+        raise ValueError(f"Unknown documentation version: {code!r}")
+    return doc_version
+
+
+def _require_doc_version_by_id(
+    repository: PeopleBooksRepository,
+    doc_version_id: int,
+) -> DocVersionRecord:
+    doc_version = repository.get_doc_version_by_id(doc_version_id)
+    if doc_version is None:
+        raise ValueError(f"Unknown documentation version id: {doc_version_id}")
+    return doc_version
+
+
+def _require_book(
+    repository: PeopleBooksRepository,
+    *,
+    doc_version_id: int,
+    code: str,
+) -> BookRecord:
+    book = repository.get_book_by_code(doc_version_id=doc_version_id, code=code)
+    if book is None:
+        raise ValueError(f"Unknown book {code!r} for documentation version id {doc_version_id}")
+    return book
+
+
+def _require_book_by_id(repository: PeopleBooksRepository, book_id: int) -> BookRecord:
+    book = repository.get_book_by_id(book_id)
+    if book is None:
+        raise ValueError(f"Unknown book id: {book_id}")
+    return book
+
+
+def _require_page_by_id(repository: PeopleBooksRepository, page_id: int) -> PageRecord:
+    page = repository.get_page_by_id(page_id)
+    if page is None:
+        raise ValueError(f"Unknown page id: {page_id}")
+    return page
+
+
+def _require_section_by_id(
+    repository: PeopleBooksRepository,
+    section_id: int,
+) -> SectionRecord:
+    section = repository.get_section_by_id(section_id)
+    if section is None:
+        raise ValueError(f"Unknown section id: {section_id}")
+    return section
+
+
+def _resolve_page(
+    repository: PeopleBooksRepository,
+    *,
+    doc_version: DocVersionRecord,
+    page_id: int | None,
+    normalized_path: str | None,
+) -> PageRecord:
+    if page_id is not None:
+        page = _require_page_by_id(repository, page_id)
+        _ensure_page_version(page, doc_version)
+        return page
+
+    if normalized_path:
+        page = repository.get_page_by_normalized_path(
+            doc_version_id=doc_version.id,
+            normalized_path=normalized_path,
+        )
+        if page is not None:
+            return page
+        raise ValueError(
+            f"Unknown page path {normalized_path!r} for documentation version {doc_version.code!r}"
+        )
+
+    raise ValueError("Provide either page_id or normalized_path")
+
+
+def _resolve_section(
+    repository: PeopleBooksRepository,
+    *,
+    doc_version: DocVersionRecord,
+    section_id: int | None,
+    section_stable_id: str | None,
+    page_id: int | None,
+    normalized_path: str | None,
+) -> SectionRecord:
+    if section_id is not None:
+        section = _require_section_by_id(repository, section_id)
+        page = _require_page_by_id(repository, section.page_id)
+        _ensure_page_version(page, doc_version)
+        return section
+
+    if not section_stable_id:
+        raise ValueError("Provide either section_id or section_stable_id")
+
+    page = _resolve_page(
+        repository,
+        doc_version=doc_version,
+        page_id=page_id,
+        normalized_path=normalized_path,
+    )
+    section = repository.get_section_by_stable_id(
+        page_id=page.id,
+        stable_id=section_stable_id,
+    )
+    if section is None:
+        raise ValueError(f"Unknown section stable id {section_stable_id!r} for page {page.id}")
+    return section
+
+
+def _ensure_page_version(page: PageRecord, doc_version: DocVersionRecord) -> None:
+    if page.doc_version_id != doc_version.id:
+        raise ValueError(f"Page {page.id} is not in documentation version {doc_version.code!r}")
+
+
+def _page_detail_payload(repository: PeopleBooksRepository, page: PageRecord) -> JsonObject:
+    version = _require_doc_version_by_id(repository, page.doc_version_id)
+    book = _require_book_by_id(repository, page.book_id)
+    sections = repository.list_sections_for_page(page_id=page.id)
+    chunks = repository.list_chunks_for_page(page_id=page.id)
+    chunks_by_section = _chunks_by_section(chunks)
+
+    return {
+        "version": _doc_version_payload(version),
+        "book": _book_payload(book),
+        "page": _page_payload(page),
+        "sections": [
+            _section_with_chunks_payload(section, chunks_by_section.get(section.id, ()))
+            for section in sections
+        ],
+    }
+
+
+def _section_detail_payload(
+    repository: PeopleBooksRepository,
+    section: SectionRecord,
+) -> JsonObject:
+    page = _require_page_by_id(repository, section.page_id)
+    version = _require_doc_version_by_id(repository, page.doc_version_id)
+    book = _require_book_by_id(repository, page.book_id)
+    chunks = repository.list_chunks_for_section(section_id=section.id)
+
+    return {
+        "version": _doc_version_payload(version),
+        "book": _book_payload(book),
+        "page": _page_payload(page),
+        "section": _section_payload(section),
+        "chunks": [_chunk_payload(chunk) for chunk in chunks],
+    }
+
+
+def _chunks_by_section(chunks: Sequence[ChunkRecord]) -> dict[int, list[ChunkRecord]]:
+    grouped: dict[int, list[ChunkRecord]] = {}
+    for chunk in chunks:
+        grouped.setdefault(chunk.section_id, []).append(chunk)
+    return grouped
+
+
+def _doc_version_payload(version: DocVersionRecord) -> JsonObject:
+    return {
+        "id": version.id,
+        "code": version.code,
+        "label": version.label,
+        "seed_url": version.seed_url,
+        "source_metadata": version.source_metadata,
+        "created_at": _iso(version.created_at),
+        "updated_at": _iso(version.updated_at),
+    }
+
+
+def _book_payload(book: BookRecord) -> JsonObject:
+    return {
+        "id": book.id,
+        "doc_version_id": book.doc_version_id,
+        "code": book.code,
+        "title": book.title,
+        "seed_url": book.seed_url,
+        "source_metadata": book.source_metadata,
+        "created_at": _iso(book.created_at),
+        "updated_at": _iso(book.updated_at),
+    }
+
+
+def _page_payload(page: PageRecord) -> JsonObject:
+    return {
+        "id": page.id,
+        "doc_version_id": page.doc_version_id,
+        "book_id": page.book_id,
+        "nav_node_id": page.nav_node_id,
+        "title": page.title,
+        "normalized_url": page.normalized_url,
+        "normalized_path": page.normalized_path,
+        "source_url": page.source_url,
+        "source_metadata": page.source_metadata,
+        "content_hash": page.content_hash,
+        "parser_version": page.parser_version,
+        "fetch_status": page.fetch_status,
+        "queued_at": _iso(page.queued_at),
+        "fetched_at": _optional_iso(page.fetched_at),
+        "parsed_at": _optional_iso(page.parsed_at),
+        "indexed_at": _optional_iso(page.indexed_at),
+    }
+
+
+def _section_with_chunks_payload(
+    section: SectionRecord,
+    chunks: Sequence[ChunkRecord],
+) -> JsonObject:
+    payload = _section_payload(section)
+    payload["chunks"] = [_chunk_payload(chunk) for chunk in chunks]
+    return payload
+
+
+def _section_payload(section: SectionRecord) -> JsonObject:
+    return {
+        "id": section.id,
+        "page_id": section.page_id,
+        "stable_id": section.stable_id,
+        "heading": section.heading,
+        "level": section.level,
+        "section_path": section.section_path,
+        "ordinal": section.ordinal,
+        "content": section.content,
+        "parser_version": section.parser_version,
+        "source_metadata": section.source_metadata,
+    }
+
+
+def _chunk_payload(chunk: ChunkRecord) -> JsonObject:
+    return {
+        "id": chunk.id,
+        "page_id": chunk.page_id,
+        "section_id": chunk.section_id,
+        "stable_id": chunk.stable_id,
+        "ordinal": chunk.ordinal,
+        "content": chunk.content,
+        "metadata": chunk.metadata,
+    }
+
+
+def _search_result_payload(result: SearchResultRecord) -> JsonObject:
+    return {
+        "version": {
+            "code": result.version_code,
+            "label": result.version_label,
+        },
+        "book": {
+            "code": result.book_code,
+            "title": result.book_title,
+        },
+        "page": {
+            "id": result.page_id,
+            "title": result.page_title,
+            "normalized_path": result.normalized_path,
+            "source_url": result.source_url,
+            "source_metadata": result.page_source_metadata,
+        },
+        "section": {
+            "id": result.section_id,
+            "stable_id": result.section_stable_id,
+            "heading": result.section_heading,
+            "section_path": result.section_path,
+        },
+        "chunk": {
+            "id": result.chunk_id,
+            "stable_id": result.chunk_stable_id,
+            "snippet": result.snippet,
+            "rank": result.rank,
+        },
+    }
+
+
+def _bounded_limit(limit: int) -> int:
+    return max(1, min(limit, 50))
+
+
+def _json(payload: JsonObject) -> str:
+    return json.dumps(payload, sort_keys=True)
+
+
+def _iso(value: datetime) -> str:
+    return value.isoformat()
+
+
+def _optional_iso(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return _iso(value)

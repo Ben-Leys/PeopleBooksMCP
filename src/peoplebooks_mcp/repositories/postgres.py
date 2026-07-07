@@ -14,6 +14,39 @@ from psycopg.types.json import Jsonb
 from peoplebooks_mcp.database import connect
 
 JsonObject = dict[str, Any]
+PAGE_METADATA_COLUMNS = """
+    id,
+    doc_version_id,
+    book_id,
+    nav_node_id,
+    normalized_url,
+    normalized_path,
+    source_url,
+    title,
+    source_metadata,
+    NULL::text AS raw_html,
+    content_hash,
+    parser_version,
+    fetch_status,
+    queued_at,
+    fetched_at,
+    parsed_at,
+    indexed_at,
+    created_at,
+    updated_at
+"""
+CHUNK_CONTENT_COLUMNS = """
+    id,
+    page_id,
+    section_id,
+    stable_id,
+    ordinal,
+    content,
+    metadata,
+    NULL::tsvector AS search_vector,
+    created_at,
+    updated_at
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +178,7 @@ class SearchResultRecord:
     page_title: str | None
     normalized_path: str
     source_url: str
+    page_source_metadata: JsonObject
     section_id: int
     section_stable_id: str
     section_heading: str
@@ -220,6 +254,23 @@ class PeopleBooksRepository:
         ).fetchone()
         return _optional_record(DocVersionRecord, row)
 
+    def get_doc_version_by_id(self, doc_version_id: int) -> DocVersionRecord | None:
+        row = self._connection.execute(
+            "SELECT * FROM doc_versions WHERE id = %s",
+            (doc_version_id,),
+        ).fetchone()
+        return _optional_record(DocVersionRecord, row)
+
+    def list_doc_versions(self) -> list[DocVersionRecord]:
+        rows = self._connection.execute(
+            """
+            SELECT *
+            FROM doc_versions
+            ORDER BY code
+            """
+        ).fetchall()
+        return [_record(DocVersionRecord, row) for row in rows]
+
     def upsert_book(
         self,
         *,
@@ -248,6 +299,13 @@ class PeopleBooksRepository:
         row = self._connection.execute(
             "SELECT * FROM books WHERE doc_version_id = %s AND code = %s",
             (doc_version_id, code),
+        ).fetchone()
+        return _optional_record(BookRecord, row)
+
+    def get_book_by_id(self, book_id: int) -> BookRecord | None:
+        row = self._connection.execute(
+            "SELECT * FROM books WHERE id = %s",
+            (book_id,),
         ).fetchone()
         return _optional_record(BookRecord, row)
 
@@ -435,6 +493,47 @@ class PeopleBooksRepository:
             (doc_version_id,),
         ).fetchall()
         return [_record(PageRecord, row) for row in rows]
+
+    def list_pages_for_book(self, *, doc_version_id: int, book_id: int) -> list[PageRecord]:
+        rows = self._connection.execute(
+            f"""
+            SELECT {PAGE_METADATA_COLUMNS}
+            FROM pages
+            WHERE doc_version_id = %s
+              AND book_id = %s
+            ORDER BY normalized_path, id
+            """,
+            (doc_version_id, book_id),
+        ).fetchall()
+        return [_record(PageRecord, row) for row in rows]
+
+    def get_page_by_id(self, page_id: int) -> PageRecord | None:
+        row = self._connection.execute(
+            f"""
+            SELECT {PAGE_METADATA_COLUMNS}
+            FROM pages
+            WHERE id = %s
+            """,
+            (page_id,),
+        ).fetchone()
+        return _optional_record(PageRecord, row)
+
+    def get_page_by_normalized_path(
+        self,
+        *,
+        doc_version_id: int,
+        normalized_path: str,
+    ) -> PageRecord | None:
+        row = self._connection.execute(
+            f"""
+            SELECT {PAGE_METADATA_COLUMNS}
+            FROM pages
+            WHERE doc_version_id = %s
+              AND normalized_path = %s
+            """,
+            (doc_version_id, normalized_path),
+        ).fetchone()
+        return _optional_record(PageRecord, row)
 
     def get_status_counts(self, *, doc_version_id: int) -> StatusCounts:
         rows = self._connection.execute(
@@ -704,15 +803,51 @@ class PeopleBooksRepository:
         ).fetchall()
         return [_record(SectionRecord, row) for row in rows]
 
-    def list_chunks_for_page(self, *, page_id: int) -> list[ChunkRecord]:
-        rows = self._connection.execute(
+    def get_section_by_id(self, section_id: int) -> SectionRecord | None:
+        row = self._connection.execute(
+            "SELECT * FROM sections WHERE id = %s",
+            (section_id,),
+        ).fetchone()
+        return _optional_record(SectionRecord, row)
+
+    def get_section_by_stable_id(
+        self,
+        *,
+        page_id: int,
+        stable_id: str,
+    ) -> SectionRecord | None:
+        row = self._connection.execute(
             """
             SELECT *
+            FROM sections
+            WHERE page_id = %s
+              AND stable_id = %s
+            """,
+            (page_id, stable_id),
+        ).fetchone()
+        return _optional_record(SectionRecord, row)
+
+    def list_chunks_for_page(self, *, page_id: int) -> list[ChunkRecord]:
+        rows = self._connection.execute(
+            f"""
+            SELECT {CHUNK_CONTENT_COLUMNS}
             FROM chunks
             WHERE page_id = %s
             ORDER BY ordinal, id
             """,
             (page_id,),
+        ).fetchall()
+        return [_record(ChunkRecord, row) for row in rows]
+
+    def list_chunks_for_section(self, *, section_id: int) -> list[ChunkRecord]:
+        rows = self._connection.execute(
+            f"""
+            SELECT {CHUNK_CONTENT_COLUMNS}
+            FROM chunks
+            WHERE section_id = %s
+            ORDER BY ordinal, id
+            """,
+            (section_id,),
         ).fetchall()
         return [_record(ChunkRecord, row) for row in rows]
 
@@ -783,6 +918,7 @@ class PeopleBooksRepository:
                 p.title AS page_title,
                 p.normalized_path AS normalized_path,
                 p.source_url AS source_url,
+                p.source_metadata AS page_source_metadata,
                 s.id AS section_id,
                 s.stable_id AS section_stable_id,
                 s.heading AS section_heading,

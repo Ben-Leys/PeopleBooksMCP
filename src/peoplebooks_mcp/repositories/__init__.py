@@ -1,1 +1,27 @@
 """Database repositories for PeopleBooks persistence."""
+
+from peoplebooks_mcp.repositories.postgres import (
+    BookRecord,
+    ChunkInput,
+    ChunkRecord,
+    DocVersionRecord,
+    FetchEventRecord,
+    NavNodeRecord,
+    PageRecord,
+    PeopleBooksRepository,
+    SectionInput,
+    SectionRecord,
+)
+
+__all__ = [
+    "BookRecord",
+    "ChunkInput",
+    "ChunkRecord",
+    "DocVersionRecord",
+    "FetchEventRecord",
+    "NavNodeRecord",
+    "PageRecord",
+    "PeopleBooksRepository",
+    "SectionInput",
+    "SectionRecord",
+]

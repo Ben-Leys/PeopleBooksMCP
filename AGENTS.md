@@ -22,6 +22,7 @@
 - Project metadata and tool defaults live in `pyproject.toml`.
 - Python package: `src/peoplebooks_mcp`.
 - Local PostgreSQL from day one.
+- Alembic migrations live in `migrations/versions`.
 - `httpx` for HTTP-first fetching.
 - BeautifulSoup plus `lxml` for parsing.
 - Typer for the CLI.
@@ -44,11 +45,13 @@
 - Core tables: `doc_versions`, `books`, `nav_nodes`, `pages`, `sections`, `chunks`, `fetch_events`.
 - Page uniqueness includes `doc_version_id` and normalized path or URL.
 - Parse leaf pages into H1/H2/H3 sections and retrieval chunks.
-- Store full-text vectors on chunks.
+- Full-text vectors on chunks are planned for Phase 5; Phase 2 stores chunk text and metadata.
 - Keep fetch diagnostics append-only.
+- PostgreSQL repository entry point: `peoplebooks_mcp.repositories.PeopleBooksRepository`.
 
 ## CLI
 
+- CLI commands exist as Typer stubs until their implementation phases.
 - `peoplebooks discover --version pt862 --book tpcr`.
 - `peoplebooks scrape --version pt862 --limit 25`.
 - `peoplebooks status --version pt862`.
@@ -58,16 +61,18 @@
 
 ## MCP
 
-- MCP is read-only until explicitly changed.
-- MCP handlers never scrape live Oracle pages.
-- Tools: `search_docs`, `get_page`, `get_section`, `list_books`.
-- Resources: versions, books, pages, sections.
-- Results include version, book, page, section path, source URL, snippet, and stable IDs.
+- MCP server behavior is planned for Phase 6; current module is a stub.
+- MCP must be read-only until explicitly changed.
+- MCP handlers must never scrape live Oracle pages.
+- Planned tools: `search_docs`, `get_page`, `get_section`, `list_books`.
+- Planned resources: versions, books, pages, sections.
+- Planned results include version, book, page, section path, source URL, snippet, and stable IDs.
 
 ## Testing
 
 - Use fixture parser tests for home, book, and leaf HTML.
 - Test fetch retry, backoff, timeout, hash, and failure recording.
 - Test repositories against local PostgreSQL.
+- PostgreSQL tests require `PEOPLEBOOKS_TEST_DATABASE_URL` pointing to a disposable database whose name contains `test`.
 - Test CLI queue, resume, `--limit`, and status behavior.
 - Test search and MCP responses over known indexed content.

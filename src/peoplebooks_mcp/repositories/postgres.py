@@ -125,6 +125,16 @@ class FetchEventRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class StatusCounts:
+    discovered: int
+    queued: int
+    fetched: int
+    failed: int
+    parsed: int
+    indexed: int
+
+
+@dataclass(frozen=True, slots=True)
 class ChunkInput:
     stable_id: str
     ordinal: int
@@ -362,6 +372,26 @@ class PeopleBooksRepository:
             (doc_version_id, limit),
         ).fetchall()
         return [_record(PageRecord, row) for row in rows]
+
+    def get_status_counts(self, *, doc_version_id: int) -> StatusCounts:
+        rows = self._connection.execute(
+            """
+            SELECT fetch_status, count(*) AS page_count
+            FROM pages
+            WHERE doc_version_id = %s
+            GROUP BY fetch_status
+            """,
+            (doc_version_id,),
+        ).fetchall()
+        by_status = {row["fetch_status"]: row["page_count"] for row in rows}
+        return StatusCounts(
+            discovered=sum(by_status.values()),
+            queued=by_status.get("queued", 0),
+            fetched=by_status.get("fetched", 0),
+            failed=by_status.get("failed", 0),
+            parsed=by_status.get("parsed", 0),
+            indexed=by_status.get("indexed", 0),
+        )
 
     def mark_page_fetched(
         self,

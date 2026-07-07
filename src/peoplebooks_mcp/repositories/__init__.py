@@ -11,6 +11,7 @@ from peoplebooks_mcp.repositories.postgres import (
     PeopleBooksRepository,
     SectionInput,
     SectionRecord,
+    StatusCounts,
 )
 
 __all__ = [
@@ -24,4 +25,5 @@ __all__ = [
     "PeopleBooksRepository",
     "SectionInput",
     "SectionRecord",
+    "StatusCounts",
 ]

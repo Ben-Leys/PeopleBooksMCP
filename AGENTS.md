@@ -37,6 +37,8 @@
 - Do not enforce `robots.txt`.
 - Store raw HTML, normalized URL, source metadata, content hash, parser version, fetch status, and timestamps.
 - Keep discovered pages and scrape state in PostgreSQL.
+- Discovery parses home/book navigation, queues book page links, and stores normalized Oracle URLs.
+- Fetching uses `peoplebooks_mcp.scraper.fetcher.PeopleBooksFetcher`.
 - `scrape --limit N` processes the next eligible pages and resumes after interruption.
 - Support reparse from stored raw HTML without refetching Oracle.
 
@@ -51,13 +53,13 @@
 
 ## CLI
 
-- CLI commands exist as Typer stubs until their implementation phases.
-- `peoplebooks discover --version pt862 --book tpcr`.
+- `peoplebooks discover --version pt862 --book tpcr` fetches seed navigation and queues pages.
 - `peoplebooks scrape --version pt862 --limit 25`.
-- `peoplebooks status --version pt862`.
+- `peoplebooks status --version pt862` prints discovered, queued, fetched, failed, parsed, and indexed counts.
 - `peoplebooks reparse --version pt862 --parser-version X`.
 - `peoplebooks index --version pt862`.
 - `peoplebooks serve-mcp`.
+- `scrape`, `reparse`, `index`, and `serve-mcp` remain Typer stubs until their implementation phases.
 
 ## MCP
 

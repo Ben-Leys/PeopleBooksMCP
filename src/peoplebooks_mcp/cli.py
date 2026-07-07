@@ -3,6 +3,9 @@ from typing import Annotated
 import typer
 
 from peoplebooks_mcp.config import load_config
+from peoplebooks_mcp.repositories import PeopleBooksRepository
+from peoplebooks_mcp.scraper.discovery import DiscoveryError, discover_book
+from peoplebooks_mcp.scraper.fetcher import FetchError, PeopleBooksFetcher
 
 app = typer.Typer(
     help="Scrape Oracle PeopleBooks into PostgreSQL and serve read-only MCP docs.",
@@ -25,7 +28,32 @@ def discover(
     if version not in config.doc_versions or book not in config.books:
         typer.echo(f"Unknown seed configuration: version={version!r}, book={book!r}")
         raise typer.Exit(code=2)
-    _not_implemented("discover")
+    version_seed = config.doc_versions[version]
+    book_seed = config.books[book]
+    if book_seed.version != version_seed.code:
+        typer.echo(f"Book {book!r} is not configured for version {version!r}")
+        raise typer.Exit(code=2)
+
+    fetcher = PeopleBooksFetcher(
+        user_agent=config.settings.user_agent,
+        timeout_seconds=config.settings.request_timeout_seconds,
+    )
+    try:
+        with PeopleBooksRepository.connect(config.settings.database_url) as repository:
+            result = discover_book(
+                repository=repository,
+                version_seed=version_seed,
+                book_seed=book_seed,
+                fetcher=fetcher,
+            )
+    except (DiscoveryError, FetchError) as error:
+        typer.echo(f"Discovery failed: {error}")
+        raise typer.Exit(code=1) from error
+
+    typer.echo(
+        f"Discovered {result.nav_nodes_discovered} navigation nodes; "
+        f"queued {result.pages_queued} pages."
+    )
 
 
 @app.command()
@@ -46,7 +74,20 @@ def status(
     """Show scrape and indexing status for a documentation version."""
     if not version:
         raise typer.Exit(code=2)
-    _not_implemented("status")
+    config = load_config()
+    with PeopleBooksRepository.connect(config.settings.database_url) as repository:
+        doc_version = repository.get_doc_version_by_code(version)
+        if doc_version is None:
+            typer.echo(f"Unknown discovered version: {version!r}")
+            raise typer.Exit(code=2)
+        counts = repository.get_status_counts(doc_version_id=doc_version.id)
+
+    typer.echo(f"discovered: {counts.discovered}")
+    typer.echo(f"queued: {counts.queued}")
+    typer.echo(f"fetched: {counts.fetched}")
+    typer.echo(f"failed: {counts.failed}")
+    typer.echo(f"parsed: {counts.parsed}")
+    typer.echo(f"indexed: {counts.indexed}")
 
 
 @app.command()

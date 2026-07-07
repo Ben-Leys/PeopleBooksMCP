@@ -37,10 +37,10 @@
 - Do not enforce `robots.txt`.
 - Store raw HTML, normalized URL, source metadata, content hash, parser version, fetch status, and timestamps.
 - Keep discovered pages and scrape state in PostgreSQL.
-- Discovery parses home/book navigation, queues book page links, and stores normalized Oracle URLs.
-- Current discovery bootstraps `tpcr` from config and does not yet persist higher-level Oracle `Products` category nodes.
-- Future discovery should parse the whole `Products` tree and discover all books from it instead of adding one seed URL per book.
-- When full-tree discovery is added, keep existing `tpcr` data as the discovered PeopleCode API Reference book; do not overwrite or duplicate it.
+- Discovery parses the Oracle home `Products` tree, queues book page links, and stores normalized Oracle URLs.
+- Full-tree discovery persists `Products` and category ancestors as book-scoped `nav_nodes` above each book root.
+- `peoplebooks discover --book tpcr` still supports the configured seed fallback when a home page has no Products tree.
+- Full-tree discovery keeps `tpcr` as the discovered PeopleCode API Reference book and preserves existing page identities.
 - Fetching uses `peoplebooks_mcp.scraper.fetcher.PeopleBooksFetcher`.
 - `scrape --limit N` processes the next eligible pages and resumes after interruption.
 - Support reparse from stored raw HTML without refetching Oracle.
@@ -49,7 +49,7 @@
 
 - Core tables: `doc_versions`, `books`, `nav_nodes`, `pages`, `sections`, `chunks`, `fetch_events`.
 - Page uniqueness includes `doc_version_id` and normalized path or URL.
-- `nav_nodes` should eventually store full Oracle category/book/page parent chains from the `Products` tree.
+- `nav_nodes` store book-scoped Oracle category/book/page parent chains from the `Products` tree.
 - Parse leaf pages into H1/H2/H3 sections and retrieval chunks.
 - Full-text vectors on chunks are stored in `chunks.search_vector` and indexed with GIN.
 - `peoplebooks_mcp.indexing.index_pages` refreshes chunk vectors and marks indexed pages.
@@ -60,6 +60,7 @@
 ## CLI
 
 - `peoplebooks discover --version pt862 --book tpcr` fetches seed navigation and queues pages.
+- `peoplebooks discover --version pt862 --all-books` discovers every book found in the Oracle `Products` tree.
 - `peoplebooks scrape --version pt862 --limit 25`.
 - `peoplebooks status --version pt862` prints discovered, queued, fetched, failed, parsed, and indexed counts.
 - `peoplebooks reparse --version pt862 --parser-version X`.
@@ -81,6 +82,6 @@
 - Use fixture parser tests for home, book, and leaf HTML.
 - Test fetch retry, backoff, timeout, hash, and failure recording.
 - Test repositories against local PostgreSQL.
-- PostgreSQL tests require `PEOPLEBOOKS_TEST_DATABASE_URL` pointing to a disposable database whose name contains `test`.
+- PostgreSQL tests require `PEOPLEBOOKS_TEST_DATABASE_URL` in the environment or `.env`, pointing to a disposable database whose name contains `test`.
 - Test CLI queue, resume, `--limit`, and status behavior.
 - Test search and MCP responses over known indexed content.

@@ -5,7 +5,7 @@ import typer
 from peoplebooks_mcp.config import load_config
 from peoplebooks_mcp.indexing import index_pages
 from peoplebooks_mcp.repositories import PeopleBooksRepository
-from peoplebooks_mcp.scraper.discovery import DiscoveryError, discover_book
+from peoplebooks_mcp.scraper.discovery import DiscoveryError, discover_book, discover_products_tree
 from peoplebooks_mcp.scraper.fetcher import FetchError, PeopleBooksFetcher
 from peoplebooks_mcp.scraper.scrape import reparse_pages, scrape_pages
 
@@ -24,17 +24,29 @@ def _not_implemented(command: str) -> None:
 def discover(
     version: Annotated[str, typer.Option(help="Documentation version key.")] = "pt862",
     book: Annotated[str, typer.Option(help="Book key to discover.")] = "tpcr",
+    all_books: Annotated[
+        bool,
+        typer.Option("--all-books", help="Discover every book found in the Oracle Products tree."),
+    ] = False,
 ) -> None:
-    """Discover and queue PeopleBooks pages for a configured book."""
+    """Discover and queue PeopleBooks pages."""
     config = load_config()
-    if version not in config.doc_versions or book not in config.books:
-        typer.echo(f"Unknown seed configuration: version={version!r}, book={book!r}")
+    if version not in config.doc_versions:
+        typer.echo(f"Unknown seed configuration: version={version!r}")
         raise typer.Exit(code=2)
+    if all_books and book != "tpcr":
+        typer.echo("--book cannot be combined with --all-books")
+        raise typer.Exit(code=2)
+
     version_seed = config.doc_versions[version]
-    book_seed = config.books[book]
-    if book_seed.version != version_seed.code:
-        typer.echo(f"Book {book!r} is not configured for version {version!r}")
-        raise typer.Exit(code=2)
+    book_seed = config.books.get(book)
+    if not all_books:
+        if book_seed is None:
+            typer.echo(f"Unknown seed configuration: version={version!r}, book={book!r}")
+            raise typer.Exit(code=2)
+        if book_seed.version != version_seed.code:
+            typer.echo(f"Book {book!r} is not configured for version {version!r}")
+            raise typer.Exit(code=2)
 
     fetcher = PeopleBooksFetcher(
         user_agent=config.settings.user_agent,
@@ -42,20 +54,35 @@ def discover(
     )
     try:
         with PeopleBooksRepository.connect(config.settings.database_url) as repository:
-            result = discover_book(
-                repository=repository,
-                version_seed=version_seed,
-                book_seed=book_seed,
-                fetcher=fetcher,
-            )
+            if all_books:
+                result = discover_products_tree(
+                    repository=repository,
+                    version_seed=version_seed,
+                    fetcher=fetcher,
+                    book_codes=None,
+                )
+            else:
+                result = discover_book(
+                    repository=repository,
+                    version_seed=version_seed,
+                    book_seed=book_seed,
+                    fetcher=fetcher,
+                )
     except (DiscoveryError, FetchError) as error:
         typer.echo(f"Discovery failed: {error}")
         raise typer.Exit(code=1) from error
 
-    typer.echo(
-        f"Discovered {result.nav_nodes_discovered} navigation nodes; "
-        f"queued {result.pages_queued} pages."
-    )
+    if all_books:
+        typer.echo(
+            f"Discovered {result.books_discovered} books; "
+            f"{result.nav_nodes_discovered} navigation nodes; "
+            f"queued {result.pages_queued} pages."
+        )
+    else:
+        typer.echo(
+            f"Discovered {result.nav_nodes_discovered} navigation nodes; "
+            f"queued {result.pages_queued} pages."
+        )
 
 
 @app.command()

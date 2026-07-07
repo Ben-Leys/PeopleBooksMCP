@@ -263,6 +263,18 @@ class PeopleBooksRepository:
         ).fetchall()
         return [_record(BookRecord, row) for row in rows]
 
+    def list_nav_nodes(self, *, doc_version_id: int) -> list[NavNodeRecord]:
+        rows = self._connection.execute(
+            """
+            SELECT *
+            FROM nav_nodes
+            WHERE doc_version_id = %s
+            ORDER BY id
+            """,
+            (doc_version_id,),
+        ).fetchall()
+        return [_record(NavNodeRecord, row) for row in rows]
+
     def upsert_nav_node(
         self,
         *,

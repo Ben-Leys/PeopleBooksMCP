@@ -22,6 +22,7 @@ def test_discover_help_shows_seed_options() -> None:
     assert result.exit_code == 0
     assert "--version" in result.output
     assert "--book" in result.output
+    assert "--all-books" in result.output
 
 
 def test_discover_command_runs_configured_discovery(monkeypatch) -> None:
@@ -55,6 +56,50 @@ def test_discover_command_runs_configured_discovery(monkeypatch) -> None:
     assert "queued 2 pages" in result.output
     assert calls[0]["version_seed"].code == "pt862"
     assert calls[0]["book_seed"].code == "tpcr"
+
+
+def test_discover_command_can_run_full_products_tree_discovery(monkeypatch) -> None:
+    calls = []
+
+    class FakeRepository:
+        pass
+
+    class FakeRepositoryContext:
+        def __enter__(self) -> FakeRepository:
+            return FakeRepository()
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+    def fake_discover_products_tree(**kwargs) -> DiscoveryResult:
+        calls.append(kwargs)
+        return DiscoveryResult(nav_nodes_discovered=6, pages_queued=3, books_discovered=2)
+
+    monkeypatch.setattr("peoplebooks_mcp.cli.load_config", _test_config)
+    monkeypatch.setattr(
+        "peoplebooks_mcp.cli.PeopleBooksRepository.connect",
+        lambda database_url: FakeRepositoryContext(),
+    )
+    monkeypatch.setattr(
+        "peoplebooks_mcp.cli.discover_products_tree",
+        fake_discover_products_tree,
+    )
+
+    result = CliRunner().invoke(app, ["discover", "--all-books"])
+
+    assert result.exit_code == 0
+    assert "Discovered 2 books; 6 navigation nodes; queued 3 pages." in result.output
+    assert calls[0]["version_seed"].code == "pt862"
+    assert calls[0]["book_codes"] is None
+
+
+def test_discover_rejects_book_option_with_all_books(monkeypatch) -> None:
+    monkeypatch.setattr("peoplebooks_mcp.cli.load_config", _test_config)
+
+    result = CliRunner().invoke(app, ["discover", "--all-books", "--book", "unknown"])
+
+    assert result.exit_code == 2
+    assert "--book cannot be combined with --all-books" in result.output
 
 
 def test_status_command_prints_lifecycle_counts(monkeypatch) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from urllib.parse import urlparse
 
 import pytest
@@ -11,7 +12,7 @@ TEST_DATABASE_ENV = "PEOPLEBOOKS_TEST_DATABASE_URL"
 
 
 def require_postgres_url() -> str:
-    database_url = os.environ.get(TEST_DATABASE_ENV)
+    database_url = os.environ.get(TEST_DATABASE_ENV) or _read_dotenv_value(TEST_DATABASE_ENV)
     if not database_url:
         pytest.skip(f"{TEST_DATABASE_ENV} is not set")
 
@@ -23,6 +24,25 @@ def require_postgres_url() -> str:
         )
 
     return database_url
+
+
+def _read_dotenv_value(key: str, path: str | Path = ".env") -> str | None:
+    dotenv_path = Path(path)
+    if not dotenv_path.is_file():
+        return None
+
+    prefix = f"{key}="
+    for line in dotenv_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or not stripped.startswith(prefix):
+            continue
+
+        value = stripped[len(prefix) :].strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        return value
+
+    return None
 
 
 @pytest.fixture

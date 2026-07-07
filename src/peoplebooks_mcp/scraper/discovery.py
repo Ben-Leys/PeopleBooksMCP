@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from peoplebooks_mcp.config import BookSeed, DocVersionSeed
@@ -23,6 +24,14 @@ class DiscoveryResult:
     books_discovered: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class DiscoveryProgress:
+    books_processed: int
+    total_books: int
+    nav_nodes_discovered: int
+    pages_queued: int
+
+
 class DiscoveryError(RuntimeError):
     pass
 
@@ -33,6 +42,7 @@ def discover_book(
     version_seed: DocVersionSeed,
     book_seed: BookSeed,
     fetcher: PeopleBooksFetcher,
+    progress: Callable[[DiscoveryProgress], None] | None = None,
 ) -> DiscoveryResult:
     home_fetch = fetcher.fetch(version_seed.seed_url)
     products_tree = parse_products_tree(home_fetch.text, base_url=version_seed.seed_url)
@@ -47,6 +57,7 @@ def discover_book(
             version_seed=version_seed,
             fetcher=fetcher,
             product_books=[product_book],
+            progress=progress,
         )
 
     book_links = parse_home_books(home_fetch.text, base_url=version_seed.seed_url)
@@ -54,6 +65,13 @@ def discover_book(
         book_links=book_links,
         version_seed=version_seed,
         book_seed=book_seed,
+    )
+    _report_discovery_progress(
+        progress=progress,
+        books_processed=0,
+        total_books=1,
+        nav_nodes_discovered=0,
+        pages_queued=0,
     )
     book_fetch = fetcher.fetch(book_source_url)
 
@@ -112,11 +130,19 @@ def discover_book(
             source_metadata=oracle_source_metadata(nav_node.source_url),
         )
 
-    return DiscoveryResult(
+    result = DiscoveryResult(
         nav_nodes_discovered=len(nav_nodes) + 1,
         pages_queued=len(nav_nodes),
         books_discovered=1,
     )
+    _report_discovery_progress(
+        progress=progress,
+        books_processed=1,
+        total_books=1,
+        nav_nodes_discovered=result.nav_nodes_discovered,
+        pages_queued=result.pages_queued,
+    )
+    return result
 
 
 def discover_products_tree(
@@ -125,6 +151,7 @@ def discover_products_tree(
     version_seed: DocVersionSeed,
     fetcher: PeopleBooksFetcher,
     book_codes: set[str] | None = None,
+    progress: Callable[[DiscoveryProgress], None] | None = None,
 ) -> DiscoveryResult:
     home_fetch = fetcher.fetch(version_seed.seed_url)
     products_tree = parse_products_tree(home_fetch.text, base_url=version_seed.seed_url)
@@ -144,6 +171,7 @@ def discover_products_tree(
         version_seed=version_seed,
         fetcher=fetcher,
         product_books=product_books,
+        progress=progress,
     )
 
 
@@ -153,6 +181,7 @@ def _discover_product_books(
     version_seed: DocVersionSeed,
     fetcher: PeopleBooksFetcher,
     product_books: list[ProductTreeNode],
+    progress: Callable[[DiscoveryProgress], None] | None = None,
 ) -> DiscoveryResult:
     version = repository.upsert_doc_version(
         code=version_seed.code,
@@ -164,6 +193,13 @@ def _discover_product_books(
     discovered_nav_nodes = 0
     queued_pages = 0
     discovered_books = 0
+    _report_discovery_progress(
+        progress=progress,
+        books_processed=discovered_books,
+        total_books=len(product_books),
+        nav_nodes_discovered=discovered_nav_nodes,
+        pages_queued=queued_pages,
+    )
     for product_book in product_books:
         if (
             product_book.book_code is None
@@ -237,11 +273,38 @@ def _discover_product_books(
         discovered_books += 1
         discovered_nav_nodes += len(nav_nodes)
         queued_pages += len(nav_nodes)
+        _report_discovery_progress(
+            progress=progress,
+            books_processed=discovered_books,
+            total_books=len(product_books),
+            nav_nodes_discovered=discovered_nav_nodes,
+            pages_queued=queued_pages,
+        )
 
     return DiscoveryResult(
         nav_nodes_discovered=discovered_nav_nodes,
         pages_queued=queued_pages,
         books_discovered=discovered_books,
+    )
+
+
+def _report_discovery_progress(
+    *,
+    progress: Callable[[DiscoveryProgress], None] | None,
+    books_processed: int,
+    total_books: int,
+    nav_nodes_discovered: int,
+    pages_queued: int,
+) -> None:
+    if progress is None:
+        return
+    progress(
+        DiscoveryProgress(
+            books_processed=books_processed,
+            total_books=total_books,
+            nav_nodes_discovered=nav_nodes_discovered,
+            pages_queued=pages_queued,
+        )
     )
 
 

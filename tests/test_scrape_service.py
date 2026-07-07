@@ -7,7 +7,7 @@ import pytest
 from peoplebooks_mcp.database import run_migrations
 from peoplebooks_mcp.repositories import PeopleBooksRepository
 from peoplebooks_mcp.scraper.fetcher import FetchError, FetchResult, sha256_content_hash
-from peoplebooks_mcp.scraper.scrape import reparse_pages, scrape_pages
+from peoplebooks_mcp.scraper.scrape import ScrapeProgress, reparse_pages, scrape_pages
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +97,36 @@ def test_scrape_pages_parses_already_fetched_raw_html_without_fetching() -> None
     assert result.parsed == 1
     assert fetcher.calls == []
     assert repository.sections[0].heading == "Fetched Before Crash"
+
+
+def test_scrape_pages_reports_progress_for_pages_as_they_are_processed() -> None:
+    page = SimplePage(
+        id=10,
+        raw_html=_leaf_html("Fetched Before Crash"),
+        source_url="https://docs.oracle.com/cd/G41075_01/pt862pbr3/eng/pt/tpcr/page.html",
+        normalized_path="/cd/G41075_01/pt862pbr3/eng/pt/tpcr/page.html",
+        fetch_status="fetched",
+    )
+    repository = FakeRepository(page=page, sections=[])
+    fetcher = FailingFetcher(calls=[])
+    progress_events: list[ScrapeProgress] = []
+
+    scrape_pages(
+        repository=repository,
+        version_code="pt862",
+        fetcher=fetcher,
+        limit=1,
+        parser_version="parser-v1",
+        progress=progress_events.append,
+    )
+
+    assert [
+        (event.pages_processed, event.total_pages, event.scraped, event.failed, event.parsed)
+        for event in progress_events
+    ] == [
+        (0, 1, 0, 0, 0),
+        (1, 1, 0, 0, 1),
+    ]
 
 
 def test_scrape_pages_obeys_limit_and_resumes_from_remaining_queue(postgres_url: str) -> None:

@@ -8,7 +8,12 @@ import pytest
 from peoplebooks_mcp.config import DEFAULT_BOOKS, DEFAULT_DOC_VERSIONS
 from peoplebooks_mcp.database import run_migrations
 from peoplebooks_mcp.repositories import PeopleBooksRepository
-from peoplebooks_mcp.scraper.discovery import DiscoveryError, discover_book, discover_products_tree
+from peoplebooks_mcp.scraper.discovery import (
+    DiscoveryError,
+    DiscoveryProgress,
+    discover_book,
+    discover_products_tree,
+)
 from peoplebooks_mcp.scraper.fetcher import PeopleBooksFetcher
 
 
@@ -92,6 +97,78 @@ def test_discover_products_tree_uses_products_category_chain_without_postgres() 
     assert repository.pages[0]["normalized_path"].endswith(
         "/pt862pbr3/eng/pt/tpcr/langref_ApplicationClass.html"
     )
+
+
+def test_discover_products_tree_reports_progress_for_each_book() -> None:
+    class FakeRepository:
+        def __init__(self) -> None:
+            self._next_id = 1
+
+        def upsert_doc_version(self, **kwargs) -> SimpleNamespace:
+            return SimpleNamespace(id=100, **kwargs)
+
+        def upsert_book(self, **kwargs) -> SimpleNamespace:
+            return SimpleNamespace(id=200, **kwargs)
+
+        def upsert_nav_node(self, **kwargs) -> SimpleNamespace:
+            record = SimpleNamespace(id=self._next_id, **kwargs)
+            self._next_id += 1
+            return record
+
+        def queue_page(self, **kwargs) -> SimpleNamespace:
+            return SimpleNamespace(id=300, **kwargs)
+
+    home_html = """
+    <html>
+      <nav id="contents">
+        <ul>
+          <li>
+            Products
+            <ul>
+              <li><a href="tpcr.html?focusnode=tpcr">PeopleCode API Reference</a></li>
+            </ul>
+          </li>
+        </ul>
+      </nav>
+    </html>
+    """
+    book_html = """
+    <html><body>
+      <a href="tpcr/langref_ApplicationClass.html">Application Class</a>
+    </body></html>
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/index.html"):
+            return httpx.Response(200, text=home_html, headers={"content-type": "text/html"})
+        return httpx.Response(200, text=book_html, headers={"content-type": "text/html"})
+
+    fetcher = PeopleBooksFetcher(
+        transport=httpx.MockTransport(handler),
+        delay_seconds=0,
+        backoff_seconds=0,
+    )
+    progress_events: list[DiscoveryProgress] = []
+
+    discover_products_tree(
+        repository=FakeRepository(),
+        version_seed=DEFAULT_DOC_VERSIONS["pt862"],
+        fetcher=fetcher,
+        progress=progress_events.append,
+    )
+
+    assert [
+        (
+            event.books_processed,
+            event.total_books,
+            event.nav_nodes_discovered,
+            event.pages_queued,
+        )
+        for event in progress_events
+    ] == [
+        (0, 1, 0, 0),
+        (1, 1, 3, 1),
+    ]
 
 
 def test_discover_book_fetches_home_and_book_navigation_then_queues_pages(

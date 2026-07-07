@@ -4,8 +4,8 @@ from peoplebooks_mcp.cli import app
 from peoplebooks_mcp.config import AppConfig, BookSeed, DocVersionSeed, RuntimeSettings
 from peoplebooks_mcp.indexing import IndexResult
 from peoplebooks_mcp.repositories import StatusCounts
-from peoplebooks_mcp.scraper.discovery import DiscoveryResult
-from peoplebooks_mcp.scraper.scrape import ReparseResult, ScrapeResult
+from peoplebooks_mcp.scraper.discovery import DiscoveryProgress, DiscoveryResult
+from peoplebooks_mcp.scraper.scrape import ReparseResult, ScrapeProgress, ScrapeResult
 
 
 def test_cli_help_lists_planned_commands() -> None:
@@ -56,6 +56,50 @@ def test_discover_command_runs_configured_discovery(monkeypatch) -> None:
     assert "queued 2 pages" in result.output
     assert calls[0]["version_seed"].code == "pt862"
     assert calls[0]["book_seed"].code == "tpcr"
+
+
+def test_discover_command_prints_progress_counter(monkeypatch) -> None:
+    class FakeRepository:
+        pass
+
+    class FakeRepositoryContext:
+        def __enter__(self) -> FakeRepository:
+            return FakeRepository()
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+    def fake_discover_book(**kwargs) -> DiscoveryResult:
+        kwargs["progress"](
+            DiscoveryProgress(
+                books_processed=0,
+                total_books=1,
+                nav_nodes_discovered=0,
+                pages_queued=0,
+            )
+        )
+        kwargs["progress"](
+            DiscoveryProgress(
+                books_processed=1,
+                total_books=1,
+                nav_nodes_discovered=2,
+                pages_queued=2,
+            )
+        )
+        return DiscoveryResult(nav_nodes_discovered=2, pages_queued=2)
+
+    monkeypatch.setattr("peoplebooks_mcp.cli.load_config", _test_config)
+    monkeypatch.setattr(
+        "peoplebooks_mcp.cli.PeopleBooksRepository.connect",
+        lambda database_url: FakeRepositoryContext(),
+    )
+    monkeypatch.setattr("peoplebooks_mcp.cli.discover_book", fake_discover_book)
+
+    result = CliRunner().invoke(app, ["discover"])
+
+    assert result.exit_code == 0
+    assert "Discovering books: 0/1; navigation nodes 0; queued 0 pages" in result.output
+    assert "Discovering books: 1/1; navigation nodes 2; queued 2 pages" in result.output
 
 
 def test_discover_command_can_run_full_products_tree_discovery(monkeypatch) -> None:
@@ -174,6 +218,52 @@ def test_scrape_command_runs_configured_scrape(monkeypatch) -> None:
     assert "parsed 2" in result.output
     assert calls[0]["version_code"] == "pt862"
     assert calls[0]["limit"] == 3
+
+
+def test_scrape_command_prints_progress_counter(monkeypatch) -> None:
+    class FakeRepository:
+        pass
+
+    class FakeRepositoryContext:
+        def __enter__(self) -> FakeRepository:
+            return FakeRepository()
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+    def fake_scrape_pages(**kwargs) -> ScrapeResult:
+        kwargs["progress"](
+            ScrapeProgress(
+                pages_processed=0,
+                total_pages=3,
+                scraped=0,
+                failed=0,
+                parsed=0,
+            )
+        )
+        kwargs["progress"](
+            ScrapeProgress(
+                pages_processed=1,
+                total_pages=3,
+                scraped=1,
+                failed=0,
+                parsed=1,
+            )
+        )
+        return ScrapeResult(scraped=1, failed=0, parsed=1)
+
+    monkeypatch.setattr("peoplebooks_mcp.cli.load_config", _test_config)
+    monkeypatch.setattr(
+        "peoplebooks_mcp.cli.PeopleBooksRepository.connect",
+        lambda database_url: FakeRepositoryContext(),
+    )
+    monkeypatch.setattr("peoplebooks_mcp.cli.scrape_pages", fake_scrape_pages)
+
+    result = CliRunner().invoke(app, ["scrape", "--limit", "3"])
+
+    assert result.exit_code == 0
+    assert "Scraping pages: 0/3; scraped 0; failed 0; parsed 0" in result.output
+    assert "Scraping pages: 1/3; scraped 1; failed 0; parsed 1" in result.output
 
 
 def test_reparse_command_runs_configured_reparse(monkeypatch) -> None:

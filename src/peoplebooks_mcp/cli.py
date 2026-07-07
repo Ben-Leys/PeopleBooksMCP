@@ -5,9 +5,14 @@ import typer
 from peoplebooks_mcp.config import load_config
 from peoplebooks_mcp.indexing import index_pages
 from peoplebooks_mcp.repositories import PeopleBooksRepository
-from peoplebooks_mcp.scraper.discovery import DiscoveryError, discover_book, discover_products_tree
+from peoplebooks_mcp.scraper.discovery import (
+    DiscoveryError,
+    DiscoveryProgress,
+    discover_book,
+    discover_products_tree,
+)
 from peoplebooks_mcp.scraper.fetcher import FetchError, PeopleBooksFetcher
-from peoplebooks_mcp.scraper.scrape import reparse_pages, scrape_pages
+from peoplebooks_mcp.scraper.scrape import ScrapeProgress, reparse_pages, scrape_pages
 
 app = typer.Typer(
     help="Scrape Oracle PeopleBooks into PostgreSQL and serve read-only MCP docs.",
@@ -18,6 +23,37 @@ app = typer.Typer(
 def _not_implemented(command: str) -> None:
     typer.echo(f"{command} is planned for a later implementation phase.")
     raise typer.Exit(code=1)
+
+
+class _ProgressLine:
+    def __init__(self) -> None:
+        self._last_length = 0
+
+    def update(self, message: str) -> None:
+        padding = " " * max(0, self._last_length - len(message))
+        typer.echo(f"\r{message}{padding}", nl=False)
+        self._last_length = len(message)
+
+    def finish(self) -> None:
+        if self._last_length == 0:
+            return
+        typer.echo()
+        self._last_length = 0
+
+
+def _format_discovery_progress(progress: DiscoveryProgress) -> str:
+    return (
+        f"Discovering books: {progress.books_processed}/{progress.total_books}; "
+        f"navigation nodes {progress.nav_nodes_discovered}; "
+        f"queued {progress.pages_queued} pages"
+    )
+
+
+def _format_scrape_progress(progress: ScrapeProgress) -> str:
+    return (
+        f"Scraping pages: {progress.pages_processed}/{progress.total_pages}; "
+        f"scraped {progress.scraped}; failed {progress.failed}; parsed {progress.parsed}"
+    )
 
 
 @app.command()
@@ -52,6 +88,7 @@ def discover(
         user_agent=config.settings.user_agent,
         timeout_seconds=config.settings.request_timeout_seconds,
     )
+    progress_line = _ProgressLine()
     try:
         with PeopleBooksRepository.connect(config.settings.database_url) as repository:
             if all_books:
@@ -60,6 +97,9 @@ def discover(
                     version_seed=version_seed,
                     fetcher=fetcher,
                     book_codes=None,
+                    progress=lambda progress: progress_line.update(
+                        _format_discovery_progress(progress)
+                    ),
                 )
             else:
                 result = discover_book(
@@ -67,11 +107,16 @@ def discover(
                     version_seed=version_seed,
                     book_seed=book_seed,
                     fetcher=fetcher,
+                    progress=lambda progress: progress_line.update(
+                        _format_discovery_progress(progress)
+                    ),
                 )
     except (DiscoveryError, FetchError) as error:
+        progress_line.finish()
         typer.echo(f"Discovery failed: {error}")
         raise typer.Exit(code=1) from error
 
+    progress_line.finish()
     if all_books:
         typer.echo(
             f"Discovered {result.books_discovered} books; "
@@ -98,6 +143,7 @@ def scrape(
         user_agent=config.settings.user_agent,
         timeout_seconds=config.settings.request_timeout_seconds,
     )
+    progress_line = _ProgressLine()
     try:
         with PeopleBooksRepository.connect(config.settings.database_url) as repository:
             result = scrape_pages(
@@ -105,11 +151,14 @@ def scrape(
                 version_code=version,
                 fetcher=fetcher,
                 limit=limit,
+                progress=lambda progress: progress_line.update(_format_scrape_progress(progress)),
             )
     except ValueError as error:
+        progress_line.finish()
         typer.echo(str(error))
         raise typer.Exit(code=2) from error
 
+    progress_line.finish()
     typer.echo(f"Scraped {result.scraped} pages; failed {result.failed}; parsed {result.parsed}.")
 
 

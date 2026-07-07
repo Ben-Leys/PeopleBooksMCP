@@ -61,7 +61,9 @@
 
 - `peoplebooks discover --version pt862 --book tpcr` fetches seed navigation and queues pages.
 - `peoplebooks discover --version pt862 --all-books` discovers every book found in the Oracle `Products` tree.
+- `discover` prints an updating book/navigation/page counter while it runs.
 - `peoplebooks scrape --version pt862 --limit 25`.
+- `scrape` prints an updating processed/scraped/failed/parsed page counter while it runs.
 - `peoplebooks status --version pt862` prints discovered, queued, fetched, failed, parsed, and indexed counts.
 - `peoplebooks reparse --version pt862 --parser-version X`.
 - `peoplebooks index --version pt862` refreshes PostgreSQL full-text vectors for parsed chunks.

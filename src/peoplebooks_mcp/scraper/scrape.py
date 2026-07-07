@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Protocol
@@ -26,6 +27,15 @@ class ScrapeResult:
 
 
 @dataclass(frozen=True, slots=True)
+class ScrapeProgress:
+    pages_processed: int
+    total_pages: int
+    scraped: int
+    failed: int
+    parsed: int
+
+
+@dataclass(frozen=True, slots=True)
 class ReparseResult:
     reparsed: int
 
@@ -37,6 +47,7 @@ def scrape_pages(
     fetcher: Fetcher,
     limit: int,
     parser_version: str = DEFAULT_PARSER_VERSION,
+    progress: Callable[[ScrapeProgress], None] | None = None,
 ) -> ScrapeResult:
     if limit < 1:
         raise ValueError("limit must be at least 1")
@@ -48,7 +59,18 @@ def scrape_pages(
     scraped = 0
     failed = 0
     parsed = 0
-    for page in repository.list_next_scrape_pages(doc_version_id=doc_version.id, limit=limit):
+    pages = repository.list_next_scrape_pages(doc_version_id=doc_version.id, limit=limit)
+    total_pages = len(pages)
+    _report_scrape_progress(
+        progress=progress,
+        pages_processed=0,
+        total_pages=total_pages,
+        scraped=scraped,
+        failed=failed,
+        parsed=parsed,
+    )
+
+    for pages_processed, page in enumerate(pages, start=1):
         if page.fetch_status == "fetched" and page.raw_html is not None:
             _replace_parsed_content(
                 repository=repository,
@@ -56,6 +78,14 @@ def scrape_pages(
                 parser_version=parser_version,
             )
             parsed += 1
+            _report_scrape_progress(
+                progress=progress,
+                pages_processed=pages_processed,
+                total_pages=total_pages,
+                scraped=scraped,
+                failed=failed,
+                parsed=parsed,
+            )
             continue
 
         try:
@@ -70,6 +100,14 @@ def scrape_pages(
                 source_url=page.source_url,
                 source_metadata=oracle_source_metadata(page.source_url),
                 metadata={"attempts": error.attempts},
+            )
+            _report_scrape_progress(
+                progress=progress,
+                pages_processed=pages_processed,
+                total_pages=total_pages,
+                scraped=scraped,
+                failed=failed,
+                parsed=parsed,
             )
             continue
 
@@ -91,6 +129,14 @@ def scrape_pages(
         )
         scraped += 1
         parsed += 1
+        _report_scrape_progress(
+            progress=progress,
+            pages_processed=pages_processed,
+            total_pages=total_pages,
+            scraped=scraped,
+            failed=failed,
+            parsed=parsed,
+        )
 
     return ScrapeResult(scraped=scraped, failed=failed, parsed=parsed)
 
@@ -137,6 +183,28 @@ def _replace_parsed_content(
             )
             for section in sections
         ],
+    )
+
+
+def _report_scrape_progress(
+    *,
+    progress: Callable[[ScrapeProgress], None] | None,
+    pages_processed: int,
+    total_pages: int,
+    scraped: int,
+    failed: int,
+    parsed: int,
+) -> None:
+    if progress is None:
+        return
+    progress(
+        ScrapeProgress(
+            pages_processed=pages_processed,
+            total_pages=total_pages,
+            scraped=scraped,
+            failed=failed,
+            parsed=parsed,
+        )
     )
 
 

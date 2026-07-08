@@ -74,9 +74,13 @@
 
 - MCP must be read-only until explicitly changed.
 - MCP handlers must never scrape live Oracle pages.
-- MCP tools: `search_docs`, `get_page`, `get_section`, `list_books`.
+- MCP tools: `health`, `search_docs`, `find_pages`, `get_page_outline`, `get_page`, `get_section`, `list_books`.
 - MCP resources expose versions, version books, book pages, pages, and sections.
 - MCP results include version, book, page, section path, source URL, source metadata, snippet, and stable IDs.
+- Agents should prefer `search_docs` or `find_pages`, then returned `page_id`/`section_id`, instead of guessing page paths.
+- Use `get_page_outline` before `get_page` when only headings and section IDs are needed.
+- `search_docs` uses strict PostgreSQL full-text search first, then a bounded relaxed fallback when strict search returns no hits.
+- `health` reports schema revision, required search columns, and parsed/indexed content readiness.
 
 ## Testing
 

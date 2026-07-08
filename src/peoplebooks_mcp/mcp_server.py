@@ -7,13 +7,16 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
+from psycopg.errors import UndefinedColumn
 
 from peoplebooks_mcp.config import load_config
 from peoplebooks_mcp.repositories import (
+    EXPECTED_SCHEMA_REVISION,
     BookRecord,
     ChunkRecord,
     DocVersionRecord,
     PageRecord,
+    PageSearchRecord,
     PeopleBooksRepository,
     SearchResultRecord,
     SectionRecord,
@@ -49,19 +52,74 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
         query: str,
         version: str = DEFAULT_VERSION,
         limit: int = 10,
+        book_code: str | None = None,
+        page_id: int | None = None,
     ) -> JsonObject:
-        """Search indexed PeopleBooks chunks."""
+        """Search indexed PeopleBooks chunks; returned page/section ids are preferred handles."""
         with PeopleBooksRepository.connect(resolved_database_url) as repository:
             doc_version = _require_doc_version(repository, version)
-            results = repository.search_chunks(
+            try:
+                results = repository.search_chunks(
+                    doc_version_id=doc_version.id,
+                    query=query,
+                    limit=_bounded_limit(limit),
+                    book_code=book_code,
+                    page_id=page_id,
+                )
+            except UndefinedColumn:
+                return _error_payload(
+                    code="schema_not_ready",
+                    message=(
+                        "Full-text search is unavailable because chunks.search_vector is "
+                        "missing. Run Alembic migrations and re-index the corpus."
+                    ),
+                    details={"expected_revision": EXPECTED_SCHEMA_REVISION},
+                )
+            match_mode = "strict"
+            if not results:
+                results = repository.search_chunks_relaxed(
+                    doc_version_id=doc_version.id,
+                    query=query,
+                    limit=_bounded_limit(limit),
+                    book_code=book_code,
+                    page_id=page_id,
+                )
+                match_mode = "relaxed" if results else "none"
+        return {
+            "query": query,
+            "match_mode": match_mode,
+            "filters": {
+                "book_code": book_code,
+                "page_id": page_id,
+            },
+            "version": _doc_version_payload(doc_version),
+            "results": [_search_result_payload(result) for result in results],
+        }
+
+    @server.tool(
+        annotations=read_only,
+        structured_output=True,
+    )
+    def find_pages(
+        query: str,
+        version: str = DEFAULT_VERSION,
+        book_code: str | None = None,
+        limit: int = 10,
+    ) -> JsonObject:
+        """Find likely pages without returning section or chunk content."""
+        with PeopleBooksRepository.connect(resolved_database_url) as repository:
+            doc_version = _require_doc_version(repository, version)
+            pages = repository.find_pages(
                 doc_version_id=doc_version.id,
                 query=query,
+                book_code=book_code,
                 limit=_bounded_limit(limit),
             )
         return {
             "query": query,
+            "book_code": book_code,
             "version": _doc_version_payload(doc_version),
-            "results": [_search_result_payload(result) for result in results],
+            "pages": [_page_search_payload(page) for page in pages],
         }
 
     @server.tool(
@@ -73,16 +131,50 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
         page_id: int | None = None,
         normalized_path: str | None = None,
     ) -> JsonObject:
-        """Read a parsed page by database id or normalized Oracle path."""
+        """Read a parsed page by returned page_id or exact stored normalized_path."""
         with PeopleBooksRepository.connect(resolved_database_url) as repository:
             doc_version = _require_doc_version(repository, version)
-            page = _resolve_page(
+            page = _resolve_page_or_none(
                 repository,
                 doc_version=doc_version,
                 page_id=page_id,
                 normalized_path=normalized_path,
             )
+            if page is None:
+                return _page_not_found_payload(
+                    repository,
+                    doc_version=doc_version,
+                    page_id=page_id,
+                    normalized_path=normalized_path,
+                )
             return _page_detail_payload(repository, page)
+
+    @server.tool(
+        annotations=read_only,
+        structured_output=True,
+    )
+    def get_page_outline(
+        version: str = DEFAULT_VERSION,
+        page_id: int | None = None,
+        normalized_path: str | None = None,
+    ) -> JsonObject:
+        """Read page metadata and headings only; use section ids for precise content."""
+        with PeopleBooksRepository.connect(resolved_database_url) as repository:
+            doc_version = _require_doc_version(repository, version)
+            page = _resolve_page_or_none(
+                repository,
+                doc_version=doc_version,
+                page_id=page_id,
+                normalized_path=normalized_path,
+            )
+            if page is None:
+                return _page_not_found_payload(
+                    repository,
+                    doc_version=doc_version,
+                    page_id=page_id,
+                    normalized_path=normalized_path,
+                )
+            return _page_outline_payload(repository, page)
 
     @server.tool(
         annotations=read_only,
@@ -98,14 +190,17 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
         """Read a parsed section by id or by page plus stable section id."""
         with PeopleBooksRepository.connect(resolved_database_url) as repository:
             doc_version = _require_doc_version(repository, version)
-            section = _resolve_section(
-                repository,
-                doc_version=doc_version,
-                section_id=section_id,
-                section_stable_id=section_stable_id,
-                page_id=page_id,
-                normalized_path=normalized_path,
-            )
+            try:
+                section = _resolve_section(
+                    repository,
+                    doc_version=doc_version,
+                    section_id=section_id,
+                    section_stable_id=section_stable_id,
+                    page_id=page_id,
+                    normalized_path=normalized_path,
+                )
+            except ValueError as error:
+                return _error_payload(code="section_not_found", message=str(error))
             return _section_detail_payload(repository, section)
 
     @server.tool(
@@ -120,6 +215,52 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
         return {
             "version": _doc_version_payload(doc_version),
             "books": [_book_payload(book) for book in books],
+        }
+
+    @server.tool(
+        annotations=read_only,
+        structured_output=True,
+    )
+    def health(version: str = DEFAULT_VERSION) -> JsonObject:
+        """Report schema and index readiness for agent querying."""
+        try:
+            with PeopleBooksRepository.connect(resolved_database_url) as repository:
+                schema_revision = repository.get_schema_revision()
+                missing_columns = repository.list_missing_required_columns()
+                schema_is_current = schema_revision == EXPECTED_SCHEMA_REVISION
+                doc_version = repository.get_doc_version_by_code(version)
+                content = None
+                if doc_version is not None:
+                    content_record = repository.get_content_health(
+                        doc_version_id=doc_version.id,
+                        include_index_counts=not missing_columns,
+                    )
+                    content = _content_health_payload(content_record)
+                status = _health_status(
+                    schema_is_current=schema_is_current,
+                    missing_columns=missing_columns,
+                    content=content,
+                    doc_version_found=doc_version is not None,
+                )
+        except Exception as error:
+            return {
+                "status": "unavailable",
+                "error": {
+                    "code": "database_unavailable",
+                    "message": str(error),
+                },
+            }
+
+        return {
+            "status": status,
+            "schema": {
+                "current_revision": schema_revision,
+                "expected_revision": EXPECTED_SCHEMA_REVISION,
+                "is_current": schema_is_current,
+                "missing_required_columns": missing_columns,
+            },
+            "version": _doc_version_payload(doc_version) if doc_version is not None else None,
+            "content": content,
         }
 
     @server.resource(
@@ -299,6 +440,28 @@ def _resolve_page(
     raise ValueError("Provide either page_id or normalized_path")
 
 
+def _resolve_page_or_none(
+    repository: PeopleBooksRepository,
+    *,
+    doc_version: DocVersionRecord,
+    page_id: int | None,
+    normalized_path: str | None,
+) -> PageRecord | None:
+    if page_id is not None:
+        page = repository.get_page_by_id(page_id)
+        if page is None or page.doc_version_id != doc_version.id:
+            return None
+        return page
+
+    if normalized_path:
+        return repository.get_page_by_normalized_path(
+            doc_version_id=doc_version.id,
+            normalized_path=normalized_path,
+        )
+
+    return None
+
+
 def _resolve_section(
     repository: PeopleBooksRepository,
     *,
@@ -352,6 +515,19 @@ def _page_detail_payload(repository: PeopleBooksRepository, page: PageRecord) ->
             _section_with_chunks_payload(section, chunks_by_section.get(section.id, ()))
             for section in sections
         ],
+    }
+
+
+def _page_outline_payload(repository: PeopleBooksRepository, page: PageRecord) -> JsonObject:
+    version = _require_doc_version_by_id(repository, page.doc_version_id)
+    book = _require_book_by_id(repository, page.book_id)
+    sections = repository.list_sections_for_page(page_id=page.id)
+
+    return {
+        "version": _doc_version_payload(version),
+        "book": _book_payload(book),
+        "page": _page_payload(page),
+        "sections": [_section_outline_payload(section) for section in sections],
     }
 
 
@@ -426,6 +602,25 @@ def _page_payload(page: PageRecord) -> JsonObject:
     }
 
 
+def _page_search_payload(page: PageSearchRecord) -> JsonObject:
+    return {
+        "id": page.id,
+        "page_id": page.id,
+        "doc_version_id": page.doc_version_id,
+        "book": {
+            "id": page.book_id,
+            "code": page.book_code,
+            "title": page.book_title,
+        },
+        "title": page.title,
+        "normalized_path": page.normalized_path,
+        "source_url": page.source_url,
+        "fetch_status": page.fetch_status,
+        "matched_terms": page.matched_terms,
+        "score": page.score,
+    }
+
+
 def _section_with_chunks_payload(
     section: SectionRecord,
     chunks: Sequence[ChunkRecord],
@@ -446,6 +641,19 @@ def _section_payload(section: SectionRecord) -> JsonObject:
         "ordinal": section.ordinal,
         "content": section.content,
         "parser_version": section.parser_version,
+        "source_metadata": section.source_metadata,
+    }
+
+
+def _section_outline_payload(section: SectionRecord) -> JsonObject:
+    return {
+        "id": section.id,
+        "page_id": section.page_id,
+        "stable_id": section.stable_id,
+        "heading": section.heading,
+        "level": section.level,
+        "section_path": section.section_path,
+        "ordinal": section.ordinal,
         "source_metadata": section.source_metadata,
     }
 
@@ -496,6 +704,90 @@ def _search_result_payload(result: SearchResultRecord) -> JsonObject:
 
 def _bounded_limit(limit: int) -> int:
     return max(1, min(limit, 50))
+
+
+def _page_not_found_payload(
+    repository: PeopleBooksRepository,
+    *,
+    doc_version: DocVersionRecord,
+    page_id: int | None,
+    normalized_path: str | None,
+) -> JsonObject:
+    if page_id is None and not normalized_path:
+        return _error_payload(
+            code="invalid_request",
+            message=(
+                "Provide either page_id returned by search/find_pages or an exact "
+                "normalized_path."
+            ),
+        )
+
+    suggestions = []
+    if normalized_path:
+        suggestions = repository.suggest_pages_for_path(
+            doc_version_id=doc_version.id,
+            normalized_path=normalized_path,
+            limit=5,
+        )
+
+    return {
+        "error": {
+            "code": "page_not_found",
+            "message": "No page matched the supplied identifier.",
+            "page_id": page_id,
+            "path": normalized_path,
+        },
+        "version": _doc_version_payload(doc_version),
+        "suggestions": [_page_search_payload(page) for page in suggestions],
+    }
+
+
+def _error_payload(
+    *,
+    code: str,
+    message: str,
+    details: JsonObject | None = None,
+) -> JsonObject:
+    payload: JsonObject = {
+        "error": {
+            "code": code,
+            "message": message,
+        }
+    }
+    if details is not None:
+        payload["error"]["details"] = details
+    return payload
+
+
+def _content_health_payload(content: Any) -> JsonObject:
+    partial_index = (
+        content.total_chunks != content.indexed_chunks
+        or content.parsed_pages != content.indexed_pages
+    )
+    return {
+        "total_pages": content.total_pages,
+        "parsed_pages": content.parsed_pages,
+        "indexed_pages": content.indexed_pages,
+        "total_chunks": content.total_chunks,
+        "indexed_chunks": content.indexed_chunks,
+        "partial_index": partial_index,
+    }
+
+
+def _health_status(
+    *,
+    schema_is_current: bool,
+    missing_columns: Sequence[str],
+    content: JsonObject | None,
+    doc_version_found: bool,
+) -> str:
+    if not schema_is_current or missing_columns or not doc_version_found:
+        return "degraded"
+    if content is None or content["parsed_pages"] == 0 or content["indexed_chunks"] == 0:
+        return "degraded"
+    if content["partial_index"]:
+        return "degraded"
+    return "ready"
 
 
 def _json(payload: JsonObject) -> str:

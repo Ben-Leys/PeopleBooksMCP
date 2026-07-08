@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+import re
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -7,13 +9,48 @@ from datetime import datetime
 from typing import Any, Self
 
 import psycopg
-from psycopg.errors import UniqueViolation
+from psycopg.errors import UndefinedTable, UniqueViolation
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from peoplebooks_mcp.database import connect
 
 JsonObject = dict[str, Any]
+EXPECTED_SCHEMA_REVISION = "0002_phase_5_full_text_indexing"
+REQUIRED_SCHEMA_COLUMNS = (("chunks", "search_vector"),)
+QUERY_TERM_RE = re.compile(r"[a-z0-9][a-z0-9_'-]*", re.IGNORECASE)
+QUERY_STOP_WORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "by",
+        "for",
+        "from",
+        "how",
+        "in",
+        "is",
+        "it",
+        "of",
+        "on",
+        "or",
+        "that",
+        "the",
+        "this",
+        "to",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "why",
+        "with",
+    }
+)
 PAGE_METADATA_COLUMNS = """
     id,
     doc_version_id,
@@ -190,6 +227,30 @@ class SearchResultRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class PageSearchRecord:
+    id: int
+    doc_version_id: int
+    book_id: int
+    book_code: str
+    book_title: str
+    title: str | None
+    normalized_path: str
+    source_url: str
+    fetch_status: str
+    matched_terms: int
+    score: float
+
+
+@dataclass(frozen=True, slots=True)
+class ContentHealthRecord:
+    total_pages: int
+    parsed_pages: int
+    indexed_pages: int
+    total_chunks: int
+    indexed_chunks: int
+
+
+@dataclass(frozen=True, slots=True)
 class ChunkInput:
     stable_id: str
     ordinal: int
@@ -270,6 +331,85 @@ class PeopleBooksRepository:
             """
         ).fetchall()
         return [_record(DocVersionRecord, row) for row in rows]
+
+    def get_schema_revision(self) -> str | None:
+        try:
+            row = self._connection.execute(
+                """
+                SELECT version_num
+                FROM alembic_version
+                ORDER BY version_num DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        except UndefinedTable:
+            return None
+        if row is None:
+            return None
+        return row["version_num"]
+
+    def list_missing_required_columns(self) -> list[str]:
+        missing: list[str] = []
+        for table_name, column_name in REQUIRED_SCHEMA_COLUMNS:
+            row = self._connection.execute(
+                """
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = %s
+                  AND column_name = %s
+                """,
+                (table_name, column_name),
+            ).fetchone()
+            if row is None:
+                missing.append(f"{table_name}.{column_name}")
+        return missing
+
+    def get_content_health(
+        self,
+        *,
+        doc_version_id: int,
+        include_index_counts: bool,
+    ) -> ContentHealthRecord:
+        if include_index_counts:
+            row = self._connection.execute(
+                """
+                SELECT
+                    count(DISTINCT p.id)::int AS total_pages,
+                    count(DISTINCT p.id) FILTER (
+                        WHERE p.fetch_status IN ('parsed', 'indexed')
+                    )::int AS parsed_pages,
+                    count(DISTINCT p.id) FILTER (
+                        WHERE p.fetch_status = 'indexed'
+                    )::int AS indexed_pages,
+                    count(c.id)::int AS total_chunks,
+                    count(c.search_vector)::int AS indexed_chunks
+                FROM pages AS p
+                LEFT JOIN chunks AS c ON c.page_id = p.id
+                WHERE p.doc_version_id = %s
+                """,
+                (doc_version_id,),
+            ).fetchone()
+        else:
+            row = self._connection.execute(
+                """
+                SELECT
+                    count(DISTINCT p.id)::int AS total_pages,
+                    count(DISTINCT p.id) FILTER (
+                        WHERE p.fetch_status IN ('parsed', 'indexed')
+                    )::int AS parsed_pages,
+                    count(DISTINCT p.id) FILTER (
+                        WHERE p.fetch_status = 'indexed'
+                    )::int AS indexed_pages,
+                    count(c.id)::int AS total_chunks,
+                    0::int AS indexed_chunks
+                FROM pages AS p
+                LEFT JOIN chunks AS c ON c.page_id = p.id
+                WHERE p.doc_version_id = %s
+                """,
+                (doc_version_id,),
+            ).fetchone()
+        return _record(ContentHealthRecord, row)
 
     def upsert_book(
         self,
@@ -506,6 +646,198 @@ class PeopleBooksRepository:
             (doc_version_id, book_id),
         ).fetchall()
         return [_record(PageRecord, row) for row in rows]
+
+    def find_pages(
+        self,
+        *,
+        doc_version_id: int,
+        query: str,
+        book_code: str | None = None,
+        limit: int = 10,
+    ) -> list[PageSearchRecord]:
+        terms = _query_terms(query)
+        bounded_limit = max(1, min(limit, 50))
+        if not terms:
+            rows = self._connection.execute(
+                """
+                SELECT
+                    p.id,
+                    p.doc_version_id,
+                    p.book_id,
+                    b.code AS book_code,
+                    b.title AS book_title,
+                    p.title,
+                    p.normalized_path,
+                    p.source_url,
+                    p.fetch_status,
+                    0::int AS matched_terms,
+                    0::float8 AS score
+                FROM pages AS p
+                JOIN books AS b ON b.id = p.book_id
+                WHERE p.doc_version_id = %s
+                  AND p.fetch_status IN ('parsed', 'indexed')
+                  AND (%s::text IS NULL OR b.code = %s)
+                ORDER BY p.id
+                LIMIT %s
+                """,
+                (doc_version_id, book_code, book_code, bounded_limit),
+            ).fetchall()
+            return [_record(PageSearchRecord, row) for row in rows]
+
+        rows = self._connection.execute(
+            """
+            WITH query_terms AS (
+                SELECT unnest(%s::text[]) AS term
+            ),
+            scored AS (
+                SELECT
+                    p.id,
+                    p.doc_version_id,
+                    p.book_id,
+                    b.code AS book_code,
+                    b.title AS book_title,
+                    p.title,
+                    p.normalized_path,
+                    p.source_url,
+                    p.fetch_status,
+                    count(DISTINCT qt.term) FILTER (
+                        WHERE lower(
+                            coalesce(b.title, '') || ' ' ||
+                            coalesce(p.title, '') || ' ' ||
+                            coalesce(array_to_string(s.section_path, ' '), '') || ' ' ||
+                            coalesce(s.heading, '') || ' ' ||
+                            coalesce(c.content, '') || ' ' ||
+                            coalesce(p.normalized_path, '')
+                        ) LIKE ('%%' || qt.term || '%%')
+                    )::int AS matched_terms,
+                    (
+                        count(DISTINCT qt.term) FILTER (
+                            WHERE lower(coalesce(b.title, '')) LIKE ('%%' || qt.term || '%%')
+                        ) * 1.0
+                        + count(DISTINCT qt.term) FILTER (
+                            WHERE lower(coalesce(p.title, '')) LIKE ('%%' || qt.term || '%%')
+                        ) * 2.0
+                        + count(DISTINCT qt.term) FILTER (
+                            WHERE lower(
+                                coalesce(array_to_string(s.section_path, ' '), '') || ' ' ||
+                                coalesce(s.heading, '')
+                            ) LIKE ('%%' || qt.term || '%%')
+                        ) * 2.0
+                        + count(DISTINCT qt.term) FILTER (
+                            WHERE lower(coalesce(c.content, '')) LIKE ('%%' || qt.term || '%%')
+                        ) * 10.0
+                        + count(DISTINCT qt.term) FILTER (
+                            WHERE lower(coalesce(p.normalized_path, '')) LIKE (
+                                '%%' || qt.term || '%%'
+                            )
+                        ) * 0.5
+                    )::float8 AS score
+                FROM pages AS p
+                JOIN books AS b ON b.id = p.book_id
+                LEFT JOIN sections AS s ON s.page_id = p.id
+                LEFT JOIN chunks AS c ON c.section_id = s.id
+                CROSS JOIN query_terms AS qt
+                WHERE p.doc_version_id = %s
+                  AND p.fetch_status IN ('parsed', 'indexed')
+                  AND (%s::text IS NULL OR b.code = %s)
+                GROUP BY
+                    p.id,
+                    p.doc_version_id,
+                    p.book_id,
+                    b.code,
+                    b.title,
+                    p.title,
+                    p.normalized_path,
+                    p.source_url,
+                    p.fetch_status
+            )
+            SELECT *
+            FROM scored
+            WHERE matched_terms > 0
+            ORDER BY matched_terms DESC, score DESC, id
+            LIMIT %s
+            """,
+            (terms, doc_version_id, book_code, book_code, bounded_limit),
+        ).fetchall()
+        return [_record(PageSearchRecord, row) for row in rows]
+
+    def suggest_pages_for_path(
+        self,
+        *,
+        doc_version_id: int,
+        normalized_path: str,
+        limit: int = 5,
+    ) -> list[PageSearchRecord]:
+        bounded_limit = max(1, min(limit, 10))
+        path = normalized_path.strip()
+        if not path:
+            return []
+
+        suffix_rows = self._connection.execute(
+            """
+            SELECT
+                p.id,
+                p.doc_version_id,
+                p.book_id,
+                b.code AS book_code,
+                b.title AS book_title,
+                p.title,
+                p.normalized_path,
+                p.source_url,
+                p.fetch_status,
+                1::int AS matched_terms,
+                100::float8 AS score
+            FROM pages AS p
+            JOIN books AS b ON b.id = p.book_id
+            WHERE p.doc_version_id = %s
+              AND p.fetch_status IN ('parsed', 'indexed')
+              AND (
+                p.normalized_path ILIKE ('%%' || %s)
+                OR p.normalized_url ILIKE ('%%' || %s)
+              )
+            ORDER BY length(p.normalized_path), p.id
+            LIMIT %s
+            """,
+            (doc_version_id, path, path, bounded_limit),
+        ).fetchall()
+        if suffix_rows:
+            return [_record(PageSearchRecord, row) for row in suffix_rows]
+
+        stem = _path_stem(path)
+        if stem:
+            book_rows = self._connection.execute(
+                """
+                SELECT
+                    p.id,
+                    p.doc_version_id,
+                    p.book_id,
+                    b.code AS book_code,
+                    b.title AS book_title,
+                    p.title,
+                    p.normalized_path,
+                    p.source_url,
+                    p.fetch_status,
+                    1::int AS matched_terms,
+                    50::float8 AS score
+                FROM pages AS p
+                JOIN books AS b ON b.id = p.book_id
+                WHERE p.doc_version_id = %s
+                  AND p.fetch_status IN ('parsed', 'indexed')
+                  AND b.code = %s
+                ORDER BY p.id
+                LIMIT %s
+                """,
+                (doc_version_id, stem, bounded_limit),
+            ).fetchall()
+            if book_rows:
+                return [_record(PageSearchRecord, row) for row in book_rows]
+
+        return self.find_pages(
+            doc_version_id=doc_version_id,
+            query=path,
+            book_code=None,
+            limit=bounded_limit,
+        )
 
     def get_page_by_id(self, page_id: int) -> PageRecord | None:
         row = self._connection.execute(
@@ -899,6 +1231,8 @@ class PeopleBooksRepository:
         doc_version_id: int,
         query: str,
         limit: int = 10,
+        book_code: str | None = None,
+        page_id: int | None = None,
     ) -> list[SearchResultRecord]:
         search_text = query.strip()
         if not search_text or limit < 1:
@@ -939,11 +1273,155 @@ class PeopleBooksRepository:
             JOIN sections AS s ON s.id = c.section_id
             CROSS JOIN search_query
             WHERE p.doc_version_id = %s
+              AND (%s::text IS NULL OR b.code = %s)
+              AND (%s::bigint IS NULL OR p.id = %s)
               AND c.search_vector @@ search_query.query
             ORDER BY rank DESC, p.id, s.ordinal, c.ordinal, c.id
             LIMIT %s
             """,
-            (search_text, doc_version_id, limit),
+            (search_text, doc_version_id, book_code, book_code, page_id, page_id, limit),
+        ).fetchall()
+        return [_record(SearchResultRecord, row) for row in rows]
+
+    def search_chunks_relaxed(
+        self,
+        *,
+        doc_version_id: int,
+        query: str,
+        limit: int = 10,
+        book_code: str | None = None,
+        page_id: int | None = None,
+    ) -> list[SearchResultRecord]:
+        terms = _query_terms(query)
+        if not terms or limit < 1:
+            return []
+
+        rows = self._connection.execute(
+            """
+            WITH query_terms AS (
+                SELECT unnest(%s::text[]) AS term
+            ),
+            scored AS (
+                SELECT
+                    dv.code AS version_code,
+                    dv.label AS version_label,
+                    b.code AS book_code,
+                    b.title AS book_title,
+                    p.id AS page_id,
+                    p.title AS page_title,
+                    p.normalized_path AS normalized_path,
+                    p.source_url AS source_url,
+                    p.source_metadata AS page_source_metadata,
+                    s.id AS section_id,
+                    s.stable_id AS section_stable_id,
+                    s.heading AS section_heading,
+                    s.section_path AS section_path,
+                    c.id AS chunk_id,
+                    c.stable_id AS chunk_stable_id,
+                    regexp_replace(c.content, '\\s+', ' ', 'g') AS clean_content,
+                    max(NULLIF(strpos(lower(c.content), qt.term), 0)) FILTER (
+                        WHERE lower(coalesce(c.content, '')) LIKE ('%%' || qt.term || '%%')
+                    ) AS snippet_match_position,
+                    count(DISTINCT qt.term) FILTER (
+                        WHERE lower(
+                            coalesce(b.title, '') || ' ' ||
+                            coalesce(p.title, '') || ' ' ||
+                            coalesce(array_to_string(s.section_path, ' '), '') || ' ' ||
+                            coalesce(s.heading, '') || ' ' ||
+                            coalesce(c.content, '')
+                        ) LIKE ('%%' || qt.term || '%%')
+                    )::int AS matched_terms,
+                    (
+                        count(DISTINCT qt.term) FILTER (
+                            WHERE lower(coalesce(b.title, '')) LIKE ('%%' || qt.term || '%%')
+                        ) * 1.0
+                        + count(DISTINCT qt.term) FILTER (
+                            WHERE lower(coalesce(p.title, '')) LIKE ('%%' || qt.term || '%%')
+                        ) * 2.0
+                        + count(DISTINCT qt.term) FILTER (
+                            WHERE lower(
+                                coalesce(array_to_string(s.section_path, ' '), '') || ' ' ||
+                                coalesce(s.heading, '')
+                            ) LIKE ('%%' || qt.term || '%%')
+                        ) * 2.0
+                        + count(DISTINCT qt.term) FILTER (
+                            WHERE lower(coalesce(c.content, '')) LIKE ('%%' || qt.term || '%%')
+                        ) * 10.0
+                    )::float8 AS rank
+                FROM chunks AS c
+                JOIN pages AS p ON p.id = c.page_id
+                JOIN books AS b ON b.id = p.book_id
+                JOIN doc_versions AS dv ON dv.id = p.doc_version_id
+                JOIN sections AS s ON s.id = c.section_id
+                CROSS JOIN query_terms AS qt
+                WHERE p.doc_version_id = %s
+                  AND p.fetch_status IN ('parsed', 'indexed')
+                  AND (%s::text IS NULL OR b.code = %s)
+                  AND (%s::bigint IS NULL OR p.id = %s)
+                GROUP BY
+                    dv.code,
+                    dv.label,
+                    b.code,
+                    b.title,
+                    p.id,
+                    p.title,
+                    p.normalized_path,
+                    p.source_url,
+                    p.source_metadata,
+                    s.id,
+                    s.stable_id,
+                    s.heading,
+                    s.section_path,
+                    c.id,
+                    c.stable_id,
+                    c.content
+            )
+            SELECT
+                version_code,
+                version_label,
+                book_code,
+                book_title,
+                page_id,
+                page_title,
+                normalized_path,
+                source_url,
+                page_source_metadata,
+                section_id,
+                section_stable_id,
+                section_heading,
+                section_path,
+                chunk_id,
+                chunk_stable_id,
+                CASE
+                    WHEN snippet_match_position IS NOT NULL
+                         AND snippet_match_position > 180
+                    THEN
+                        '...'
+                        || substring(clean_content FROM snippet_match_position - 180 FOR 450)
+                        || CASE
+                            WHEN length(clean_content) > snippet_match_position + 270
+                            THEN '...'
+                            ELSE ''
+                        END
+                    WHEN length(clean_content) > 450 THEN left(clean_content, 450) || '...'
+                    ELSE clean_content
+                END AS snippet,
+                rank
+            FROM scored
+            WHERE matched_terms >= %s
+            ORDER BY matched_terms DESC, rank DESC, page_id, section_id, chunk_id
+            LIMIT %s
+            """,
+            (
+                terms,
+                doc_version_id,
+                book_code,
+                book_code,
+                page_id,
+                page_id,
+                _minimum_relaxed_matches(len(terms)),
+                max(1, min(limit, 50)),
+            ),
         ).fetchall()
         return [_record(SearchResultRecord, row) for row in rows]
 
@@ -1012,3 +1490,32 @@ def _optional_record[T](record_type: type[T], row: JsonObject | None) -> T | Non
     if row is None:
         return None
     return _record(record_type, row)
+
+
+def _query_terms(query: str, *, max_terms: int = 16) -> list[str]:
+    terms: list[str] = []
+    seen: set[str] = set()
+    for match in QUERY_TERM_RE.finditer(query.lower()):
+        term = match.group(0).strip("'_-")
+        if len(term) < 2 or term in QUERY_STOP_WORDS or term in seen:
+            continue
+        seen.add(term)
+        terms.append(term)
+        if len(terms) >= max_terms:
+            break
+    return terms
+
+
+def _minimum_relaxed_matches(term_count: int) -> int:
+    if term_count <= 1:
+        return 1
+    if term_count <= 4:
+        return 2
+    return max(2, min(6, math.ceil(term_count * 0.3)))
+
+
+def _path_stem(path: str) -> str:
+    leaf = path.rstrip("/").rsplit("/", 1)[-1].lower()
+    if leaf.endswith(".html"):
+        leaf = leaf[:-5]
+    return leaf

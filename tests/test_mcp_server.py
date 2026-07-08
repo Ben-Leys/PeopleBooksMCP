@@ -96,6 +96,66 @@ def test_mcp_tool_can_get_section_by_page_path_and_stable_id(postgres_url: str) 
     assert result["chunks"][0]["stable_id"] == "createarray-0"
 
 
+def test_mcp_get_section_defaults_to_compact_budget_and_full_detail_is_opt_in(
+    postgres_url: str,
+) -> None:
+    run_migrations(postgres_url)
+    ids = _seed_long_section_docs(postgres_url)
+    server = create_server(database_url=postgres_url)
+
+    compact = _call_tool(
+        server,
+        "get_section",
+        {"version": "pt862", "section_id": ids["section_id"], "max_chars": 90},
+    )
+    full = _call_tool(
+        server,
+        "get_section",
+        {
+            "version": "pt862",
+            "section_id": ids["section_id"],
+            "detail": "full",
+            "max_chars": 500,
+        },
+    )
+
+    assert "content" not in compact["section"]
+    assert "content" not in compact["chunks"][0]
+    assert compact["chunks"][0]["snippet"].endswith("...")
+    assert len(compact["chunks"][0]["snippet"]) <= 93
+    assert compact["budget"]["detail"] == "compact"
+    assert compact["budget"]["truncated"] is True
+
+    assert full["section"]["content"].startswith("Application classes can expose")
+    assert full["chunks"][0]["content"].startswith("Application classes can expose")
+    assert full["budget"]["detail"] == "full"
+
+
+def test_mcp_tools_and_resources_never_expose_raw_html(postgres_url: str) -> None:
+    run_migrations(postgres_url)
+    ids = _seed_long_section_docs(postgres_url)
+    server = create_server(database_url=postgres_url)
+
+    payloads = [
+        _call_tool(server, "list_books", {"version": "pt862"}),
+        _call_tool(server, "search_docs", {"version": "pt862", "query": "application class"}),
+        _call_tool(server, "find_pages", {"version": "pt862", "query": "application class"}),
+        _call_tool(server, "get_page", {"version": "pt862", "page_id": ids["page_id"]}),
+        _call_tool(server, "get_page_outline", {"version": "pt862", "page_id": ids["page_id"]}),
+        _call_tool(server, "get_section", {"version": "pt862", "section_id": ids["section_id"]}),
+        _call_tool(server, "health", {"version": "pt862"}),
+        _read_json_resource(server, "peoplebooks://versions"),
+        _read_json_resource(server, "peoplebooks://versions/pt862"),
+        _read_json_resource(server, "peoplebooks://versions/pt862/books"),
+        _read_json_resource(server, "peoplebooks://versions/pt862/books/tpcr/pages"),
+        _read_json_resource(server, f"peoplebooks://pages/{ids['page_id']}"),
+        _read_json_resource(server, f"peoplebooks://sections/{ids['section_id']}"),
+    ]
+
+    for payload in payloads:
+        assert "raw_html" not in _json_keys(payload)
+
+
 def test_mcp_health_reports_ready_schema_and_index_counts(postgres_url: str) -> None:
     run_migrations(postgres_url)
     _seed_agent_workflow_docs(postgres_url)
@@ -285,6 +345,140 @@ def test_mcp_search_docs_page_id_filter_scopes_results(postgres_url: str) -> Non
     assert {item["page"]["page_id"] for item in result["results"]} == {ids["overview_page_id"]}
 
 
+def test_mcp_search_docs_respects_snippet_budget(postgres_url: str) -> None:
+    run_migrations(postgres_url)
+    ids = _seed_agent_workflow_docs(postgres_url)
+    server = create_server(database_url=postgres_url)
+
+    result = _call_tool(
+        server,
+        "search_docs",
+        {
+            "version": "pt862",
+            "query": "Application Engine rare tail marker",
+            "page_id": ids["long_tail_page_id"],
+            "max_chars": 80,
+        },
+    )
+
+    snippet = result["results"][0]["chunk"]["snippet"]
+    assert len(snippet) <= 83
+    assert result["budget"]["max_chars"] == 80
+    assert result["budget"]["truncated"] is True
+
+
+def test_mcp_search_docs_budget_applies_across_all_returned_snippets(
+    postgres_url: str,
+) -> None:
+    run_migrations(postgres_url)
+    _seed_many_search_result_docs(postgres_url)
+    server = create_server(database_url=postgres_url)
+
+    result = _call_tool(
+        server,
+        "search_docs",
+        {
+            "version": "pt862",
+            "query": "BudgetTerm",
+            "limit": 5,
+            "max_chars": 120,
+        },
+    )
+
+    snippets = [item["chunk"]["snippet"] for item in result["results"]]
+    assert len(snippets) > 1
+    assert sum(len(snippet) for snippet in snippets) <= 120
+    assert result["budget"]["truncated"] is True
+
+
+def test_mcp_get_section_budget_applies_across_all_returned_chunks(postgres_url: str) -> None:
+    run_migrations(postgres_url)
+    ids = _seed_multi_chunk_section_docs(postgres_url)
+    server = create_server(database_url=postgres_url)
+
+    result = _call_tool(
+        server,
+        "get_section",
+        {"version": "pt862", "section_id": ids["section_id"], "max_chars": 120},
+    )
+
+    snippets = [chunk["snippet"] for chunk in result["chunks"]]
+    assert len(snippets) == 3
+    assert sum(len(snippet) for snippet in snippets) <= 120
+    assert result["budget"]["truncated"] is True
+
+
+def test_mcp_search_docs_exact_mode_prefers_title_and_heading_matches(
+    postgres_url: str,
+) -> None:
+    run_migrations(postgres_url)
+    ids = _seed_agent_workflow_docs(postgres_url)
+    server = create_server(database_url=postgres_url)
+
+    result = _call_tool(
+        server,
+        "search_docs",
+        {
+            "version": "pt862",
+            "book_code": "tape",
+            "query": "Application Engine Program Elements",
+            "search_mode": "exact",
+            "limit": 3,
+        },
+    )
+
+    assert result["match_mode"] == "exact"
+    assert result["results"][0]["page"]["page_id"] == ids["program_elements_page_id"]
+    assert result["results"][0]["section"]["heading"] == "Application Engine Program Elements"
+
+
+def test_mcp_search_docs_exact_mode_treats_peoplecode_wildcards_literally(
+    postgres_url: str,
+) -> None:
+    run_migrations(postgres_url)
+    ids = _seed_peoplecode_wildcard_docs(postgres_url)
+    server = create_server(database_url=postgres_url)
+
+    result = _call_tool(
+        server,
+        "search_docs",
+        {
+            "version": "pt862",
+            "query": "%This",
+            "search_mode": "exact",
+            "limit": 5,
+        },
+    )
+
+    assert {item["page"]["page_id"] for item in result["results"]} == {
+        ids["percent_this_page_id"]
+    }
+
+
+def test_mcp_search_docs_exact_mode_returns_diverse_page_candidates(
+    postgres_url: str,
+) -> None:
+    run_migrations(postgres_url)
+    ids = _seed_exact_diversity_docs(postgres_url)
+    server = create_server(database_url=postgres_url)
+
+    result = _call_tool(
+        server,
+        "search_docs",
+        {
+            "version": "pt862",
+            "query": "DoStuff",
+            "search_mode": "exact",
+            "limit": 2,
+        },
+    )
+
+    assert [item["page"]["page_id"] for item in result["results"]] == [
+        ids["do_stuff_page_id"],
+        ids["do_stuff_example_page_id"],
+    ]
+
+
 def test_mcp_search_docs_relaxed_snippet_is_near_matched_terms(postgres_url: str) -> None:
     run_migrations(postgres_url)
     ids = _seed_agent_workflow_docs(postgres_url)
@@ -327,6 +521,23 @@ def test_mcp_get_page_unknown_path_returns_structured_suggestions(postgres_url: 
     assert "content" not in result["suggestions"][0]
 
 
+def test_mcp_tool_metadata_has_specific_output_schemas_and_workflow_descriptions() -> None:
+    server = create_server(database_url="postgresql://example/unused")
+
+    tools = {tool.name: tool for tool in _run(server.list_tools())}
+
+    search_schema = tools["search_docs"].outputSchema
+    section_schema = tools["get_section"].outputSchema
+    assert search_schema["properties"]["results"]["type"] == "array"
+    budget_schema = _schema_property(section_schema, "budget")
+    assert budget_schema["properties"]["detail"]["type"] == "string"
+    assert search_schema.get("additionalProperties") is not True
+    assert tools["get_page"].outputSchema.get("additionalProperties") is not True
+    assert tools["get_page_outline"].outputSchema.get("additionalProperties") is not True
+    assert "Use first for questions" in tools["search_docs"].description
+    assert "Use after search_docs or get_page_outline" in tools["get_section"].description
+
+
 def _run[T](awaitable: Awaitable[T]) -> T:
     return asyncio.run(awaitable)
 
@@ -339,6 +550,30 @@ def _call_tool(server: Any, name: str, arguments: dict[str, Any]) -> dict[str, A
 def _read_json_resource(server: Any, uri: str) -> dict[str, Any]:
     contents = _run(server.read_resource(uri))
     return json.loads(contents[0].content)
+
+
+def _json_keys(value: Any) -> set[str]:
+    keys: set[str] = set()
+    if isinstance(value, dict):
+        for key, item in value.items():
+            keys.add(str(key))
+            keys.update(_json_keys(item))
+    elif isinstance(value, list):
+        for item in value:
+            keys.update(_json_keys(item))
+    return keys
+
+
+def _schema_property(schema: dict[str, Any], name: str) -> dict[str, Any]:
+    prop = schema["properties"][name]
+    variants = prop.get("anyOf")
+    if variants is not None:
+        prop = next(variant for variant in variants if variant.get("type") != "null")
+    ref = prop.get("$ref")
+    if ref is None:
+        return prop
+    _, definition_name = ref.rsplit("/", 1)
+    return schema["$defs"][definition_name]
 
 
 def _seed_indexed_docs(database_url: str) -> dict[str, int]:
@@ -392,6 +627,322 @@ def _seed_indexed_docs(database_url: str) -> dict[str, int]:
         index_pages(repository=repository, version_code="pt862")
 
     return {"page_id": page.id, "section_id": section.id}
+
+
+def _seed_long_section_docs(database_url: str) -> dict[str, int]:
+    with PeopleBooksRepository.connect(database_url) as repository:
+        version = repository.upsert_doc_version(
+            code="pt862",
+            label="PeopleTools 8.62",
+            seed_url="https://docs.oracle.com/cd/G41075_01/pt862pbr3/eng/pt/index.html",
+        )
+        book = repository.upsert_book(
+            doc_version_id=version.id,
+            code="tpcr",
+            title="PeopleCode API Reference",
+            seed_url=version.seed_url,
+        )
+        raw_html = (
+            "<html><body><h1>Application Class Methods</h1>"
+            "<p>Application classes can expose methods and properties for PeopleCode callers.</p>"
+            "<p>Use PeopleBooks to confirm argument order, return values, and restrictions.</p>"
+            "</body></html>"
+        )
+        page, _event = repository.record_fetch_success(
+            page_id=repository.queue_page(
+                doc_version_id=version.id,
+                book_id=book.id,
+                normalized_url=(
+                    "https://docs.oracle.com/cd/G41075_01/pt862pbr3/eng/pt/tpcr/"
+                    "applicationclassmethods.html"
+                ),
+                normalized_path=(
+                    "/cd/G41075_01/pt862pbr3/eng/pt/tpcr/applicationclassmethods.html"
+                ),
+                source_url=(
+                    "https://docs.oracle.com/cd/G41075_01/pt862pbr3/eng/pt/tpcr/"
+                    "applicationclassmethods.html"
+                ),
+                title="Application Class Methods",
+            ).id,
+            raw_html=raw_html,
+            content_hash="sha256:test",
+            status_code=200,
+            elapsed_ms=10,
+            source_url=(
+                "https://docs.oracle.com/cd/G41075_01/pt862pbr3/eng/pt/tpcr/"
+                "applicationclassmethods.html"
+            ),
+        )
+        content = (
+            "Application classes can expose methods and properties for PeopleCode callers. "
+            "Use PeopleBooks to confirm argument order, return values, and restrictions. "
+            "This longer paragraph verifies that MCP callers receive compact snippets by default."
+        )
+        repository.replace_page_sections(
+            page_id=page.id,
+            parser_version="parser-v1",
+            sections=[
+                SectionInput(
+                    stable_id="application-class-methods",
+                    heading="Application Class Methods",
+                    level=1,
+                    section_path=("Application Class Methods",),
+                    ordinal=0,
+                    content=content,
+                    chunks=[
+                        ChunkInput(
+                            stable_id="application-class-methods-0",
+                            ordinal=0,
+                            content=content,
+                            metadata={},
+                        )
+                    ],
+                    source_metadata={},
+                )
+            ],
+        )
+        section = repository.list_sections_for_page(page_id=page.id)[0]
+        index_pages(repository=repository, version_code="pt862")
+
+    return {"page_id": page.id, "section_id": section.id}
+
+
+def _seed_many_search_result_docs(database_url: str) -> None:
+    with PeopleBooksRepository.connect(database_url) as repository:
+        version = repository.upsert_doc_version(
+            code="pt862",
+            label="PeopleTools 8.62",
+            seed_url="https://docs.oracle.com/cd/G41075_01/pt862pbr3/eng/pt/index.html",
+        )
+        book = repository.upsert_book(
+            doc_version_id=version.id,
+            code="tpcr",
+            title="PeopleCode API Reference",
+            seed_url=version.seed_url,
+        )
+        for index in range(5):
+            content = (
+                f"BudgetTerm page {index} has enough repeated documentation text to exceed "
+                "small aggregate response budgets for MCP clients."
+            )
+            _queue_page_with_sections(
+                repository=repository,
+                doc_version_id=version.id,
+                book_id=book.id,
+                slug=f"BudgetTerm{index}",
+                title=f"Budget Term {index}",
+                sections=[
+                    SectionInput(
+                        stable_id=f"budget-term-{index}",
+                        heading=f"Budget Term {index}",
+                        level=1,
+                        section_path=(f"Budget Term {index}",),
+                        ordinal=0,
+                        content=content,
+                        chunks=[
+                            ChunkInput(
+                                stable_id=f"budget-term-{index}-0",
+                                ordinal=0,
+                                content=content,
+                                metadata={},
+                            )
+                        ],
+                        source_metadata={},
+                    )
+                ],
+            )
+        index_pages(repository=repository, version_code="pt862")
+
+
+def _seed_multi_chunk_section_docs(database_url: str) -> dict[str, int]:
+    with PeopleBooksRepository.connect(database_url) as repository:
+        version = repository.upsert_doc_version(
+            code="pt862",
+            label="PeopleTools 8.62",
+            seed_url="https://docs.oracle.com/cd/G41075_01/pt862pbr3/eng/pt/index.html",
+        )
+        book = repository.upsert_book(
+            doc_version_id=version.id,
+            code="tpcr",
+            title="PeopleCode API Reference",
+            seed_url=version.seed_url,
+        )
+        page = _queue_page_with_sections(
+            repository=repository,
+            doc_version_id=version.id,
+            book_id=book.id,
+            slug="MultiChunkBudget",
+            title="Multi Chunk Budget",
+            sections=[
+                SectionInput(
+                    stable_id="multi-chunk-budget",
+                    heading="Multi Chunk Budget",
+                    level=1,
+                    section_path=("Multi Chunk Budget",),
+                    ordinal=0,
+                    content="Combined section content is intentionally long.",
+                    chunks=[
+                        ChunkInput(
+                            stable_id=f"multi-chunk-budget-{index}",
+                            ordinal=index,
+                            content=(
+                                f"Chunk {index} contains enough documentation text to exceed "
+                                "small aggregate response budgets for MCP clients."
+                            ),
+                            metadata={},
+                        )
+                        for index in range(3)
+                    ],
+                    source_metadata={},
+                )
+            ],
+        )
+        section = repository.list_sections_for_page(page_id=page.id)[0]
+        index_pages(repository=repository, version_code="pt862")
+    return {"section_id": section.id}
+
+
+def _seed_peoplecode_wildcard_docs(database_url: str) -> dict[str, int]:
+    with PeopleBooksRepository.connect(database_url) as repository:
+        version = repository.upsert_doc_version(
+            code="pt862",
+            label="PeopleTools 8.62",
+            seed_url="https://docs.oracle.com/cd/G41075_01/pt862pbr3/eng/pt/index.html",
+        )
+        book = repository.upsert_book(
+            doc_version_id=version.id,
+            code="tpcr",
+            title="PeopleCode API Reference",
+            seed_url=version.seed_url,
+        )
+        percent_page = _queue_page_with_sections(
+            repository=repository,
+            doc_version_id=version.id,
+            book_id=book.id,
+            slug="PercentThis",
+            title="%This",
+            sections=[
+                SectionInput(
+                    stable_id="percent-this",
+                    heading="%This",
+                    level=1,
+                    section_path=("%This",),
+                    ordinal=0,
+                    content="%This refers to the current object instance.",
+                    chunks=[
+                        ChunkInput(
+                            stable_id="percent-this-0",
+                            ordinal=0,
+                            content="%This refers to the current object instance.",
+                            metadata={},
+                        )
+                    ],
+                    source_metadata={},
+                )
+            ],
+        )
+        _queue_page_with_sections(
+            repository=repository,
+            doc_version_id=version.id,
+            book_id=book.id,
+            slug="PlainThis",
+            title="Plain This",
+            sections=[
+                SectionInput(
+                    stable_id="plain-this",
+                    heading="Plain This",
+                    level=1,
+                    section_path=("Plain This",),
+                    ordinal=0,
+                    content="This page should not match a literal percent-prefixed query.",
+                    chunks=[
+                        ChunkInput(
+                            stable_id="plain-this-0",
+                            ordinal=0,
+                            content="This page should not match a literal percent-prefixed query.",
+                            metadata={},
+                        )
+                    ],
+                    source_metadata={},
+                )
+            ],
+        )
+        index_pages(repository=repository, version_code="pt862")
+    return {"percent_this_page_id": percent_page.id}
+
+
+def _seed_exact_diversity_docs(database_url: str) -> dict[str, int]:
+    with PeopleBooksRepository.connect(database_url) as repository:
+        version = repository.upsert_doc_version(
+            code="pt862",
+            label="PeopleTools 8.62",
+            seed_url="https://docs.oracle.com/cd/G41075_01/pt862pbr3/eng/pt/index.html",
+        )
+        book = repository.upsert_book(
+            doc_version_id=version.id,
+            code="tpcr",
+            title="PeopleCode API Reference",
+            seed_url=version.seed_url,
+        )
+        do_stuff_page = _queue_page_with_sections(
+            repository=repository,
+            doc_version_id=version.id,
+            book_id=book.id,
+            slug="DoStuff",
+            title="DoStuff",
+            sections=[
+                SectionInput(
+                    stable_id=f"do-stuff-{index}",
+                    heading=f"DoStuff Detail {index}",
+                    level=1,
+                    section_path=(f"DoStuff Detail {index}",),
+                    ordinal=index,
+                    content=f"DoStuff repeated detail {index}.",
+                    chunks=[
+                        ChunkInput(
+                            stable_id=f"do-stuff-{index}-0",
+                            ordinal=0,
+                            content=f"DoStuff repeated detail {index}.",
+                            metadata={},
+                        )
+                    ],
+                    source_metadata={},
+                )
+                for index in range(3)
+            ],
+        )
+        example_page = _queue_page_with_sections(
+            repository=repository,
+            doc_version_id=version.id,
+            book_id=book.id,
+            slug="DoStuffExamples",
+            title="DoStuff Examples",
+            sections=[
+                SectionInput(
+                    stable_id="do-stuff-examples",
+                    heading="DoStuff Examples",
+                    level=1,
+                    section_path=("DoStuff Examples",),
+                    ordinal=0,
+                    content="DoStuff examples show valid usage.",
+                    chunks=[
+                        ChunkInput(
+                            stable_id="do-stuff-examples-0",
+                            ordinal=0,
+                            content="DoStuff examples show valid usage.",
+                            metadata={},
+                        )
+                    ],
+                    source_metadata={},
+                )
+            ],
+        )
+        index_pages(repository=repository, version_code="pt862")
+    return {
+        "do_stuff_page_id": do_stuff_page.id,
+        "do_stuff_example_page_id": example_page.id,
+    }
 
 
 def _seed_agent_workflow_docs(database_url: str, *, index: bool = True) -> dict[str, int]:

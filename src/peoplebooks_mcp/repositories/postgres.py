@@ -1283,6 +1283,132 @@ class PeopleBooksRepository:
         ).fetchall()
         return [_record(SearchResultRecord, row) for row in rows]
 
+    def search_chunks_exact(
+        self,
+        *,
+        doc_version_id: int,
+        query: str,
+        limit: int = 10,
+        book_code: str | None = None,
+        page_id: int | None = None,
+    ) -> list[SearchResultRecord]:
+        search_text = query.strip()
+        if not search_text or limit < 1:
+            return []
+
+        rows = self._connection.execute(
+            """
+            WITH exact_query AS (
+                SELECT
+                    lower(%s) AS query,
+                    replace(lower(%s), ' ', '') AS compact_query
+            ),
+            scored AS (
+                SELECT
+                    dv.code AS version_code,
+                    dv.label AS version_label,
+                    b.code AS book_code,
+                    b.title AS book_title,
+                    p.id AS page_id,
+                    p.title AS page_title,
+                    p.normalized_path AS normalized_path,
+                    p.source_url AS source_url,
+                    p.source_metadata AS page_source_metadata,
+                    s.id AS section_id,
+                    s.stable_id AS section_stable_id,
+                    s.heading AS section_heading,
+                    s.section_path AS section_path,
+                    c.id AS chunk_id,
+                    c.stable_id AS chunk_stable_id,
+                    regexp_replace(c.content, '\\s+', ' ', 'g') AS clean_content,
+                    (
+                        CASE
+                            WHEN lower(coalesce(p.title, '')) = exact_query.query THEN 100
+                            ELSE 0
+                        END
+                        + CASE
+                            WHEN lower(coalesce(s.heading, '')) = exact_query.query THEN 90
+                            ELSE 0
+                          END
+                        + CASE
+                            WHEN position(
+                                exact_query.query
+                                IN lower(coalesce(array_to_string(s.section_path, ' '), ''))
+                            ) > 0
+                            THEN 40 ELSE 0
+                          END
+                        + CASE
+                            WHEN position(
+                                exact_query.compact_query
+                                IN lower(coalesce(p.normalized_path, ''))
+                            ) > 0
+                            THEN 25 ELSE 0
+                          END
+                        + CASE
+                            WHEN position(exact_query.query IN lower(coalesce(c.content, ''))) > 0
+                            THEN 10 ELSE 0
+                          END
+                    )::float8 AS rank
+                FROM chunks AS c
+                JOIN pages AS p ON p.id = c.page_id
+                JOIN books AS b ON b.id = p.book_id
+                JOIN doc_versions AS dv ON dv.id = p.doc_version_id
+                JOIN sections AS s ON s.id = c.section_id
+                CROSS JOIN exact_query
+                WHERE p.doc_version_id = %s
+                  AND p.fetch_status IN ('parsed', 'indexed')
+                  AND (%s::text IS NULL OR b.code = %s)
+                  AND (%s::bigint IS NULL OR p.id = %s)
+            ),
+            ranked AS (
+                SELECT
+                    scored.*,
+                    row_number() OVER (
+                        PARTITION BY page_id
+                        ORDER BY rank DESC, section_id, chunk_id
+                    ) AS page_rank
+                FROM scored
+            )
+            SELECT
+                version_code,
+                version_label,
+                book_code,
+                book_title,
+                page_id,
+                page_title,
+                normalized_path,
+                source_url,
+                page_source_metadata,
+                section_id,
+                section_stable_id,
+                section_heading,
+                section_path,
+                chunk_id,
+                chunk_stable_id,
+                CASE
+                    WHEN length(clean_content) > 450 THEN left(clean_content, 450) || '...'
+                    ELSE clean_content
+                END AS snippet,
+                rank
+            FROM ranked
+            WHERE rank > 0
+              AND page_rank = 1
+            ORDER BY rank DESC, page_id, section_id, chunk_id
+            LIMIT %s
+            """,
+            (
+                search_text,
+                search_text,
+                doc_version_id,
+                book_code,
+                book_code,
+                page_id,
+                page_id,
+                max(1, min(limit, 50)),
+            ),
+        ).fetchall()
+        return [_record(SearchResultRecord, row) for row in rows]
+
     def search_chunks_relaxed(
         self,
         *,

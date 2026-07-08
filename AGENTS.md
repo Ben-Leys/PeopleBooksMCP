@@ -77,12 +77,16 @@
 - MCP tools: `health`, `search_docs`, `find_pages`, `get_page_outline`, `get_page`, `get_section`, `list_books`.
 - MCP resources expose versions, version books, book pages, pages, and sections.
 - MCP results should be retrieval-oriented and compact by default.
+- Raw HTML is retained for reparsing and must not be exposed through MCP tools/resources.
 - MCP tool/resource payloads omit crawler/debug fields such as source metadata, hashes, parser versions, fetch status, and timestamps.
 - MCP results include version, book, page, section path, source URL, snippet, rank, and stable IDs when useful for retrieval.
 - Agents should prefer `search_docs` or `find_pages`, then returned `page_id`/`section_id`, instead of guessing page paths.
+- Use `search_docs(search_mode="exact")` for specific API/page/heading lookups.
+- `search_docs` and `get_section` support `max_chars` budgets; keep compact defaults unless full content is needed.
 - Use `get_page_outline` before `get_section` when only headings and section IDs are needed.
 - `get_page_outline` returns paged headings with `limit`, `offset`, `next_offset`, and optional `max_level`.
 - `get_page` returns page metadata and compact section headings; use `get_section` for body content.
+- `get_section` defaults to compact snippets; request `detail="full"` only for exact section text.
 - `search_docs` uses strict PostgreSQL full-text search first, then a bounded relaxed fallback when strict search returns no hits.
 - `health` reports schema revision, required search columns, and parsed/indexed content readiness.
 

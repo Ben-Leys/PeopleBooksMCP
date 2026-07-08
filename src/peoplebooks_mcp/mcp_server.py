@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from psycopg.errors import UndefinedColumn
+from pydantic import BaseModel, ConfigDict, Field
 
 from peoplebooks_mcp.config import load_config
 from peoplebooks_mcp.repositories import (
@@ -22,9 +23,176 @@ from peoplebooks_mcp.repositories import (
 )
 
 JsonObject = dict[str, Any]
+DetailLevel = Literal["compact", "normal", "full"]
+SearchMode = Literal["auto", "exact"]
 
 DEFAULT_VERSION = "pt862"
 JSON_MIME_TYPE = "application/json"
+DEFAULT_SNIPPET_CHARS = 450
+DEFAULT_SECTION_CHARS = 1200
+MAX_RESPONSE_CHARS = 8000
+
+
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class ErrorDetailPayload(StrictModel):
+    code: str
+    message: str
+    details: JsonObject | None = None
+    page_id: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    path: str | None = Field(default=None, exclude_if=lambda value: value is None)
+
+
+class ErrorPayload(StrictModel):
+    error: ErrorDetailPayload
+
+
+class VersionPayload(StrictModel):
+    id: int
+    code: str
+    label: str
+
+
+class SearchVersionPayload(StrictModel):
+    code: str
+
+
+class BookPayload(StrictModel):
+    id: int
+    code: str
+    title: str
+
+
+class SearchBookPayload(StrictModel):
+    code: str
+    title: str
+
+
+class PagePayload(StrictModel):
+    id: int
+    title: str | None = None
+    normalized_path: str
+    source_url: str
+
+
+class SearchPagePayload(StrictModel):
+    page_id: int
+    title: str | None = None
+    normalized_path: str
+    source_url: str
+
+
+class PageSearchPayload(StrictModel):
+    page_id: int
+    book: SearchBookPayload
+    title: str | None = None
+    normalized_path: str
+    source_url: str
+    matched_terms: int
+    score: float
+
+
+class SectionOutlinePayload(StrictModel):
+    id: int
+    stable_id: str
+    heading: str
+    level: int
+
+
+class SectionPayload(SectionOutlinePayload):
+    page_id: int
+    section_path: list[str]
+    ordinal: int
+    content: str | None = Field(default=None, exclude_if=lambda value: value is None)
+
+
+class ChunkPayload(StrictModel):
+    id: int
+    stable_id: str
+    ordinal: int
+    snippet: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    content: str | None = Field(default=None, exclude_if=lambda value: value is None)
+
+
+class BudgetPayload(StrictModel):
+    detail: str
+    max_chars: int
+    truncated: bool
+
+
+class SearchSectionPayload(StrictModel):
+    section_id: int
+    stable_id: str
+    heading: str
+    section_path: list[str]
+
+
+class SearchChunkPayload(StrictModel):
+    chunk_id: int
+    stable_id: str
+    snippet: str
+    rank: float
+
+
+class SearchResultPayload(StrictModel):
+    version: SearchVersionPayload
+    book: SearchBookPayload
+    page: SearchPagePayload
+    section: SearchSectionPayload
+    chunk: SearchChunkPayload
+
+
+class SearchDocsResponse(StrictModel):
+    query: str
+    match_mode: str
+    filters: JsonObject
+    budget: BudgetPayload
+    version: VersionPayload
+    results: list[SearchResultPayload]
+    error: ErrorDetailPayload | None = Field(default=None, exclude_if=lambda value: value is None)
+
+
+class FindPagesResponse(StrictModel):
+    query: str
+    book_code: str | None
+    version: VersionPayload
+    pages: list[PageSearchPayload]
+
+
+class PageDetailResponse(StrictModel):
+    version: VersionPayload | None = Field(default=None, exclude_if=lambda value: value is None)
+    book: BookPayload | None = Field(default=None, exclude_if=lambda value: value is None)
+    page: PagePayload | None = Field(default=None, exclude_if=lambda value: value is None)
+    section_count: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    returned_count: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    offset: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    next_offset: int | None = None
+    sections: list[SectionOutlinePayload] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    suggestions: list[PageSearchPayload] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    error: ErrorDetailPayload | None = Field(default=None, exclude_if=lambda value: value is None)
+
+
+class SectionDetailResponse(StrictModel):
+    version: VersionPayload | None = Field(default=None, exclude_if=lambda value: value is None)
+    book: BookPayload | None = Field(default=None, exclude_if=lambda value: value is None)
+    page: PagePayload | None = Field(default=None, exclude_if=lambda value: value is None)
+    section: SectionPayload | None = Field(default=None, exclude_if=lambda value: value is None)
+    chunks: list[ChunkPayload] | None = Field(default=None, exclude_if=lambda value: value is None)
+    budget: BudgetPayload | None = Field(default=None, exclude_if=lambda value: value is None)
+    error: ErrorDetailPayload | None = Field(default=None, exclude_if=lambda value: value is None)
+
+
+class ListBooksResponse(StrictModel):
+    version: VersionPayload
+    books: list[BookPayload]
 
 
 def create_server(*, database_url: str | None = None) -> FastMCP:
@@ -53,46 +221,86 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
         limit: int = 10,
         book_code: str | None = None,
         page_id: int | None = None,
-    ) -> JsonObject:
-        """Search indexed PeopleBooks chunks; returned page/section ids are preferred handles."""
+        search_mode: SearchMode = "auto",
+        max_chars: int = DEFAULT_SNIPPET_CHARS,
+    ) -> SearchDocsResponse:
+        """Use first for questions or code checks. Returns compact snippets and stable handles."""
         with PeopleBooksRepository.connect(resolved_database_url) as repository:
             doc_version = _require_doc_version(repository, version)
+            bounded_limit = _bounded_limit(limit)
+            bounded_max_chars = _bounded_max_chars(max_chars, default=DEFAULT_SNIPPET_CHARS)
             try:
-                results = repository.search_chunks(
-                    doc_version_id=doc_version.id,
-                    query=query,
-                    limit=_bounded_limit(limit),
-                    book_code=book_code,
-                    page_id=page_id,
-                )
+                if search_mode == "exact":
+                    results = repository.search_chunks_exact(
+                        doc_version_id=doc_version.id,
+                        query=query,
+                        limit=bounded_limit,
+                        book_code=book_code,
+                        page_id=page_id,
+                    )
+                    match_mode = "exact" if results else "none"
+                else:
+                    results = repository.search_chunks(
+                        doc_version_id=doc_version.id,
+                        query=query,
+                        limit=bounded_limit,
+                        book_code=book_code,
+                        page_id=page_id,
+                    )
+                    match_mode = "strict"
             except UndefinedColumn:
-                return _error_payload(
-                    code="schema_not_ready",
-                    message=(
-                        "Full-text search is unavailable because chunks.search_vector is "
-                        "missing. Run Alembic migrations and re-index the corpus."
-                    ),
-                    details={"expected_revision": EXPECTED_SCHEMA_REVISION},
-                )
-            match_mode = "strict"
-            if not results:
+                return {
+                    "query": query,
+                    "match_mode": "error",
+                    "filters": {
+                        "book_code": book_code,
+                        "page_id": page_id,
+                        "search_mode": search_mode,
+                    },
+                    "budget": {
+                        "detail": "compact",
+                        "max_chars": bounded_max_chars,
+                        "truncated": False,
+                    },
+                    "version": _doc_version_payload(doc_version),
+                    "results": [],
+                    "error": {
+                        "code": "schema_not_ready",
+                        "message": (
+                            "Full-text search is unavailable because chunks.search_vector is "
+                            "missing. Run Alembic migrations and re-index the corpus."
+                        ),
+                        "details": {"expected_revision": EXPECTED_SCHEMA_REVISION},
+                    },
+                }
+            if search_mode == "auto" and not results:
                 results = repository.search_chunks_relaxed(
                     doc_version_id=doc_version.id,
                     query=query,
-                    limit=_bounded_limit(limit),
+                    limit=bounded_limit,
                     book_code=book_code,
                     page_id=page_id,
                 )
                 match_mode = "relaxed" if results else "none"
+        payloads, truncated = _search_result_payloads(
+            results,
+            max_chars=bounded_max_chars,
+        )
         return {
             "query": query,
             "match_mode": match_mode,
             "filters": {
                 "book_code": book_code,
                 "page_id": page_id,
+                "search_mode": search_mode,
+            },
+            "budget": {
+                "detail": "compact",
+                "max_chars": bounded_max_chars,
+                "truncated": truncated,
             },
             "version": _doc_version_payload(doc_version),
-            "results": [_search_result_payload(result) for result in results],
+            "results": payloads,
         }
 
     @server.tool(
@@ -104,8 +312,8 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
         version: str = DEFAULT_VERSION,
         book_code: str | None = None,
         limit: int = 10,
-    ) -> JsonObject:
-        """Find likely pages without returning section or chunk content."""
+    ) -> FindPagesResponse:
+        """Use to locate likely pages without spending tokens on section or chunk content."""
         with PeopleBooksRepository.connect(resolved_database_url) as repository:
             doc_version = _require_doc_version(repository, version)
             pages = repository.find_pages(
@@ -132,8 +340,8 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
         limit: int = 50,
         offset: int = 0,
         max_level: int | None = None,
-    ) -> JsonObject:
-        """Read compact page metadata and paged headings by page_id or normalized_path."""
+    ) -> PageDetailResponse:
+        """Use after find_pages/search_docs to read compact, paged headings for one page."""
         with PeopleBooksRepository.connect(resolved_database_url) as repository:
             doc_version = _require_doc_version(repository, version)
             page = _resolve_page_or_none(
@@ -168,8 +376,8 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
         limit: int = 50,
         offset: int = 0,
         max_level: int | None = None,
-    ) -> JsonObject:
-        """Read a compact, paged heading outline; use section ids for precise content."""
+    ) -> PageDetailResponse:
+        """Use before get_section when only headings and section ids are needed."""
         with PeopleBooksRepository.connect(resolved_database_url) as repository:
             doc_version = _require_doc_version(repository, version)
             page = _resolve_page_or_none(
@@ -203,8 +411,10 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
         section_stable_id: str | None = None,
         page_id: int | None = None,
         normalized_path: str | None = None,
-    ) -> JsonObject:
-        """Read a parsed section by id or by page plus stable section id."""
+        detail: DetailLevel = "compact",
+        max_chars: int = DEFAULT_SECTION_CHARS,
+    ) -> SectionDetailResponse:
+        """Use after search_docs or get_page_outline. Compact by default; full content is opt-in."""
         with PeopleBooksRepository.connect(resolved_database_url) as repository:
             doc_version = _require_doc_version(repository, version)
             try:
@@ -218,14 +428,19 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
                 )
             except ValueError as error:
                 return _error_payload(code="section_not_found", message=str(error))
-            return _section_detail_payload(repository, section)
+            return _section_detail_payload(
+                repository,
+                section,
+                detail=detail,
+                max_chars=max_chars,
+            )
 
     @server.tool(
         annotations=read_only,
         structured_output=True,
     )
-    def list_books(version: str = DEFAULT_VERSION) -> JsonObject:
-        """List discovered books for a PeopleBooks version."""
+    def list_books(version: str = DEFAULT_VERSION) -> ListBooksResponse:
+        """List book codes for scoping later search_docs or find_pages calls."""
         with PeopleBooksRepository.connect(resolved_database_url) as repository:
             doc_version = _require_doc_version(repository, version)
             books = repository.list_books(doc_version_id=doc_version.id)
@@ -378,7 +593,14 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
     def section_resource(section_id: int) -> str:
         with PeopleBooksRepository.connect(resolved_database_url) as repository:
             section = _require_section_by_id(repository, section_id)
-            return _json(_section_detail_payload(repository, section))
+            return _json(
+                _section_detail_payload(
+                    repository,
+                    section,
+                    detail="compact",
+                    max_chars=DEFAULT_SECTION_CHARS,
+                )
+            )
 
     return server
 
@@ -607,18 +829,45 @@ def _windowed_sections(
 def _section_detail_payload(
     repository: PeopleBooksRepository,
     section: SectionRecord,
+    *,
+    detail: DetailLevel,
+    max_chars: int,
 ) -> JsonObject:
     page = _require_page_by_id(repository, section.page_id)
     version = _require_doc_version_by_id(repository, page.doc_version_id)
     book = _require_book_by_id(repository, page.book_id)
     chunks = repository.list_chunks_for_section(section_id=section.id)
+    bounded_max_chars = _bounded_max_chars(max_chars, default=DEFAULT_SECTION_CHARS)
+    section_texts = [section.content] if detail == "full" else []
+    chunk_texts = [chunk.content for chunk in chunks]
+    budgeted_texts, text_truncated = _truncate_texts_to_budget(
+        [*section_texts, *chunk_texts],
+        max_chars=bounded_max_chars,
+    )
+    section_content = budgeted_texts[0] if section_texts else None
+    chunk_start = 1 if section_texts else 0
+    chunk_contents = budgeted_texts[chunk_start:]
+    chunk_payloads, chunk_truncated = _chunk_payloads(
+        chunks,
+        detail=detail,
+        contents=chunk_contents,
+    )
+    section_payload = _section_payload(
+        section,
+        content=section_content,
+    )
 
     return {
         "version": _doc_version_payload(version),
         "book": _book_payload(book),
         "page": _page_payload(page),
-        "section": _section_payload(section),
-        "chunks": [_chunk_payload(chunk) for chunk in chunks],
+        "section": section_payload,
+        "chunks": chunk_payloads,
+        "budget": {
+            "detail": detail,
+            "max_chars": bounded_max_chars,
+            "truncated": text_truncated or chunk_truncated,
+        },
     }
 
 
@@ -662,8 +911,12 @@ def _page_search_payload(page: PageSearchRecord) -> JsonObject:
     }
 
 
-def _section_payload(section: SectionRecord) -> JsonObject:
-    return {
+def _section_payload(
+    section: SectionRecord,
+    *,
+    content: str | None,
+) -> JsonObject:
+    payload = {
         "id": section.id,
         "page_id": section.page_id,
         "stable_id": section.stable_id,
@@ -671,8 +924,10 @@ def _section_payload(section: SectionRecord) -> JsonObject:
         "level": section.level,
         "section_path": section.section_path,
         "ordinal": section.ordinal,
-        "content": section.content,
     }
+    if content is not None:
+        payload["content"] = content
+    return payload
 
 
 def _section_outline_payload(section: SectionRecord) -> JsonObject:
@@ -684,13 +939,26 @@ def _section_outline_payload(section: SectionRecord) -> JsonObject:
     }
 
 
-def _chunk_payload(chunk: ChunkRecord) -> JsonObject:
-    return {
-        "id": chunk.id,
-        "stable_id": chunk.stable_id,
-        "ordinal": chunk.ordinal,
-        "content": chunk.content,
-    }
+def _chunk_payloads(
+    chunks: Sequence[ChunkRecord],
+    *,
+    detail: DetailLevel,
+    contents: Sequence[str],
+) -> tuple[list[JsonObject], bool]:
+    payloads: list[JsonObject] = []
+    truncated_any = len(contents) < len(chunks)
+    for chunk, text in zip(chunks, contents, strict=False):
+        payload: JsonObject = {
+            "id": chunk.id,
+            "stable_id": chunk.stable_id,
+            "ordinal": chunk.ordinal,
+        }
+        if detail == "full":
+            payload["content"] = text
+        else:
+            payload["snippet"] = text
+        payloads.append(payload)
+    return payloads, truncated_any
 
 
 def _search_result_payload(result: SearchResultRecord) -> JsonObject:
@@ -723,8 +991,31 @@ def _search_result_payload(result: SearchResultRecord) -> JsonObject:
     }
 
 
+def _search_result_payloads(
+    results: Sequence[SearchResultRecord],
+    *,
+    max_chars: int,
+) -> tuple[list[JsonObject], bool]:
+    payloads: list[JsonObject] = []
+    snippets, truncated_any = _truncate_texts_to_budget(
+        [result.snippet for result in results],
+        max_chars=max_chars,
+    )
+    for result, snippet in zip(results, snippets, strict=False):
+        payload = _search_result_payload(result)
+        payload["chunk"]["snippet"] = snippet
+        payloads.append(payload)
+    return payloads, truncated_any
+
+
 def _bounded_limit(limit: int) -> int:
     return max(1, min(limit, 50))
+
+
+def _bounded_max_chars(max_chars: int, *, default: int) -> int:
+    if max_chars < 1:
+        return default
+    return max(40, min(max_chars, MAX_RESPONSE_CHARS))
 
 
 def _bounded_outline_limit(limit: int) -> int:
@@ -733,6 +1024,37 @@ def _bounded_outline_limit(limit: int) -> int:
 
 def _bounded_offset(offset: int) -> int:
     return max(0, offset)
+
+
+def _truncate_texts_to_budget(texts: Sequence[str], *, max_chars: int) -> tuple[list[str], bool]:
+    if not texts:
+        return [], False
+
+    remaining = max(0, max_chars)
+    output: list[str] = []
+    truncated_any = False
+    for index, text in enumerate(texts):
+        slots_left = len(texts) - index
+        limit = remaining // slots_left if slots_left else 0
+        truncated_text, truncated = _truncate_text(text, max_chars=limit)
+        output.append(truncated_text)
+        remaining -= len(truncated_text)
+        truncated_any = truncated_any or truncated
+
+    return output, truncated_any
+
+
+def _truncate_text(text: str, *, max_chars: int) -> tuple[str, bool]:
+    clean = " ".join(text.split())
+    if max_chars <= 0:
+        return "", bool(clean)
+    if len(clean) <= max_chars:
+        return clean, False
+    if max_chars <= 3:
+        return clean[:max_chars], True
+    if clean.startswith("..."):
+        return "..." + clean[-(max_chars - 3) :].lstrip(), True
+    return clean[: max_chars - 3].rstrip() + "...", True
 
 
 def _page_not_found_payload(

@@ -76,9 +76,13 @@
 - MCP handlers must never scrape live Oracle pages.
 - MCP tools: `health`, `search_docs`, `find_pages`, `get_page_outline`, `get_page`, `get_section`, `list_books`.
 - MCP resources expose versions, version books, book pages, pages, and sections.
-- MCP results include version, book, page, section path, source URL, source metadata, snippet, and stable IDs.
+- MCP results should be retrieval-oriented and compact by default.
+- MCP tool/resource payloads omit crawler/debug fields such as source metadata, hashes, parser versions, fetch status, and timestamps.
+- MCP results include version, book, page, section path, source URL, snippet, rank, and stable IDs when useful for retrieval.
 - Agents should prefer `search_docs` or `find_pages`, then returned `page_id`/`section_id`, instead of guessing page paths.
-- Use `get_page_outline` before `get_page` when only headings and section IDs are needed.
+- Use `get_page_outline` before `get_section` when only headings and section IDs are needed.
+- `get_page_outline` returns paged headings with `limit`, `offset`, `next_offset`, and optional `max_level`.
+- `get_page` returns page metadata and compact section headings; use `get_section` for body content.
 - `search_docs` uses strict PostgreSQL full-text search first, then a bounded relaxed fallback when strict search returns no hits.
 - `health` reports schema revision, required search columns, and parsed/indexed content readiness.
 

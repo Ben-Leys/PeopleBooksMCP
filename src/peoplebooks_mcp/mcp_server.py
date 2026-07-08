@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from datetime import datetime
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -130,8 +129,11 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
         version: str = DEFAULT_VERSION,
         page_id: int | None = None,
         normalized_path: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+        max_level: int | None = None,
     ) -> JsonObject:
-        """Read a parsed page by returned page_id or exact stored normalized_path."""
+        """Read compact page metadata and paged headings by page_id or normalized_path."""
         with PeopleBooksRepository.connect(resolved_database_url) as repository:
             doc_version = _require_doc_version(repository, version)
             page = _resolve_page_or_none(
@@ -147,7 +149,13 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
                     page_id=page_id,
                     normalized_path=normalized_path,
                 )
-            return _page_detail_payload(repository, page)
+            return _page_detail_payload(
+                repository,
+                page,
+                limit=limit,
+                offset=offset,
+                max_level=max_level,
+            )
 
     @server.tool(
         annotations=read_only,
@@ -157,8 +165,11 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
         version: str = DEFAULT_VERSION,
         page_id: int | None = None,
         normalized_path: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+        max_level: int | None = None,
     ) -> JsonObject:
-        """Read page metadata and headings only; use section ids for precise content."""
+        """Read a compact, paged heading outline; use section ids for precise content."""
         with PeopleBooksRepository.connect(resolved_database_url) as repository:
             doc_version = _require_doc_version(repository, version)
             page = _resolve_page_or_none(
@@ -174,7 +185,13 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
                     page_id=page_id,
                     normalized_path=normalized_path,
                 )
-            return _page_outline_payload(repository, page)
+            return _page_outline_payload(
+                repository,
+                page,
+                limit=limit,
+                offset=offset,
+                max_level=max_level,
+            )
 
     @server.tool(
         annotations=read_only,
@@ -341,7 +358,15 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
     def page_resource(page_id: int) -> str:
         with PeopleBooksRepository.connect(resolved_database_url) as repository:
             page = _require_page_by_id(repository, page_id)
-            return _json(_page_detail_payload(repository, page))
+            return _json(
+                _page_detail_payload(
+                    repository,
+                    page,
+                    limit=50,
+                    offset=0,
+                    max_level=None,
+                )
+            )
 
     @server.resource(
         "peoplebooks://sections/{section_id}",
@@ -500,35 +525,83 @@ def _ensure_page_version(page: PageRecord, doc_version: DocVersionRecord) -> Non
         raise ValueError(f"Page {page.id} is not in documentation version {doc_version.code!r}")
 
 
-def _page_detail_payload(repository: PeopleBooksRepository, page: PageRecord) -> JsonObject:
+def _page_detail_payload(
+    repository: PeopleBooksRepository,
+    page: PageRecord,
+    *,
+    limit: int,
+    offset: int,
+    max_level: int | None,
+) -> JsonObject:
     version = _require_doc_version_by_id(repository, page.doc_version_id)
     book = _require_book_by_id(repository, page.book_id)
     sections = repository.list_sections_for_page(page_id=page.id)
-    chunks = repository.list_chunks_for_page(page_id=page.id)
-    chunks_by_section = _chunks_by_section(chunks)
+    section_count, bounded_offset, next_offset, window = _windowed_sections(
+        sections,
+        limit=limit,
+        offset=offset,
+        max_level=max_level,
+    )
 
     return {
         "version": _doc_version_payload(version),
         "book": _book_payload(book),
         "page": _page_payload(page),
-        "sections": [
-            _section_with_chunks_payload(section, chunks_by_section.get(section.id, ()))
-            for section in sections
-        ],
+        "section_count": section_count,
+        "returned_count": len(window),
+        "offset": bounded_offset,
+        "next_offset": next_offset,
+        "sections": [_section_outline_payload(section) for section in window],
     }
 
 
-def _page_outline_payload(repository: PeopleBooksRepository, page: PageRecord) -> JsonObject:
+def _page_outline_payload(
+    repository: PeopleBooksRepository,
+    page: PageRecord,
+    *,
+    limit: int,
+    offset: int,
+    max_level: int | None,
+) -> JsonObject:
     version = _require_doc_version_by_id(repository, page.doc_version_id)
     book = _require_book_by_id(repository, page.book_id)
     sections = repository.list_sections_for_page(page_id=page.id)
+    section_count, bounded_offset, next_offset, window = _windowed_sections(
+        sections,
+        limit=limit,
+        offset=offset,
+        max_level=max_level,
+    )
 
     return {
         "version": _doc_version_payload(version),
         "book": _book_payload(book),
         "page": _page_payload(page),
-        "sections": [_section_outline_payload(section) for section in sections],
+        "section_count": section_count,
+        "returned_count": len(window),
+        "offset": bounded_offset,
+        "next_offset": next_offset,
+        "sections": [_section_outline_payload(section) for section in window],
     }
+
+
+def _windowed_sections(
+    sections: Sequence[SectionRecord],
+    *,
+    limit: int,
+    offset: int,
+    max_level: int | None,
+) -> tuple[int, int, int | None, Sequence[SectionRecord]]:
+    if max_level is not None:
+        sections = [section for section in sections if section.level <= max(1, max_level)]
+    section_count = len(sections)
+    bounded_offset = _bounded_offset(offset)
+    bounded_limit = _bounded_outline_limit(limit)
+    window = sections[bounded_offset : bounded_offset + bounded_limit]
+    next_offset = bounded_offset + bounded_limit
+    if next_offset >= section_count:
+        next_offset = None
+    return section_count, bounded_offset, next_offset, window
 
 
 def _section_detail_payload(
@@ -549,85 +622,44 @@ def _section_detail_payload(
     }
 
 
-def _chunks_by_section(chunks: Sequence[ChunkRecord]) -> dict[int, list[ChunkRecord]]:
-    grouped: dict[int, list[ChunkRecord]] = {}
-    for chunk in chunks:
-        grouped.setdefault(chunk.section_id, []).append(chunk)
-    return grouped
-
-
 def _doc_version_payload(version: DocVersionRecord) -> JsonObject:
     return {
         "id": version.id,
         "code": version.code,
         "label": version.label,
-        "seed_url": version.seed_url,
-        "source_metadata": version.source_metadata,
-        "created_at": _iso(version.created_at),
-        "updated_at": _iso(version.updated_at),
     }
 
 
 def _book_payload(book: BookRecord) -> JsonObject:
     return {
         "id": book.id,
-        "doc_version_id": book.doc_version_id,
         "code": book.code,
         "title": book.title,
-        "seed_url": book.seed_url,
-        "source_metadata": book.source_metadata,
-        "created_at": _iso(book.created_at),
-        "updated_at": _iso(book.updated_at),
     }
 
 
 def _page_payload(page: PageRecord) -> JsonObject:
     return {
         "id": page.id,
-        "doc_version_id": page.doc_version_id,
-        "book_id": page.book_id,
-        "nav_node_id": page.nav_node_id,
         "title": page.title,
-        "normalized_url": page.normalized_url,
         "normalized_path": page.normalized_path,
         "source_url": page.source_url,
-        "source_metadata": page.source_metadata,
-        "content_hash": page.content_hash,
-        "parser_version": page.parser_version,
-        "fetch_status": page.fetch_status,
-        "queued_at": _iso(page.queued_at),
-        "fetched_at": _optional_iso(page.fetched_at),
-        "parsed_at": _optional_iso(page.parsed_at),
-        "indexed_at": _optional_iso(page.indexed_at),
     }
 
 
 def _page_search_payload(page: PageSearchRecord) -> JsonObject:
     return {
-        "id": page.id,
         "page_id": page.id,
-        "doc_version_id": page.doc_version_id,
         "book": {
-            "id": page.book_id,
             "code": page.book_code,
             "title": page.book_title,
         },
         "title": page.title,
         "normalized_path": page.normalized_path,
         "source_url": page.source_url,
-        "fetch_status": page.fetch_status,
         "matched_terms": page.matched_terms,
         "score": page.score,
     }
-
-
-def _section_with_chunks_payload(
-    section: SectionRecord,
-    chunks: Sequence[ChunkRecord],
-) -> JsonObject:
-    payload = _section_payload(section)
-    payload["chunks"] = [_chunk_payload(chunk) for chunk in chunks]
-    return payload
 
 
 def _section_payload(section: SectionRecord) -> JsonObject:
@@ -640,33 +672,24 @@ def _section_payload(section: SectionRecord) -> JsonObject:
         "section_path": section.section_path,
         "ordinal": section.ordinal,
         "content": section.content,
-        "parser_version": section.parser_version,
-        "source_metadata": section.source_metadata,
     }
 
 
 def _section_outline_payload(section: SectionRecord) -> JsonObject:
     return {
         "id": section.id,
-        "page_id": section.page_id,
         "stable_id": section.stable_id,
         "heading": section.heading,
         "level": section.level,
-        "section_path": section.section_path,
-        "ordinal": section.ordinal,
-        "source_metadata": section.source_metadata,
     }
 
 
 def _chunk_payload(chunk: ChunkRecord) -> JsonObject:
     return {
         "id": chunk.id,
-        "page_id": chunk.page_id,
-        "section_id": chunk.section_id,
         "stable_id": chunk.stable_id,
         "ordinal": chunk.ordinal,
         "content": chunk.content,
-        "metadata": chunk.metadata,
     }
 
 
@@ -674,27 +697,25 @@ def _search_result_payload(result: SearchResultRecord) -> JsonObject:
     return {
         "version": {
             "code": result.version_code,
-            "label": result.version_label,
         },
         "book": {
             "code": result.book_code,
             "title": result.book_title,
         },
         "page": {
-            "id": result.page_id,
+            "page_id": result.page_id,
             "title": result.page_title,
             "normalized_path": result.normalized_path,
             "source_url": result.source_url,
-            "source_metadata": result.page_source_metadata,
         },
         "section": {
-            "id": result.section_id,
+            "section_id": result.section_id,
             "stable_id": result.section_stable_id,
             "heading": result.section_heading,
             "section_path": result.section_path,
         },
         "chunk": {
-            "id": result.chunk_id,
+            "chunk_id": result.chunk_id,
             "stable_id": result.chunk_stable_id,
             "snippet": result.snippet,
             "rank": result.rank,
@@ -704,6 +725,14 @@ def _search_result_payload(result: SearchResultRecord) -> JsonObject:
 
 def _bounded_limit(limit: int) -> int:
     return max(1, min(limit, 50))
+
+
+def _bounded_outline_limit(limit: int) -> int:
+    return max(1, min(limit, 100))
+
+
+def _bounded_offset(offset: int) -> int:
+    return max(0, offset)
 
 
 def _page_not_found_payload(
@@ -792,13 +821,3 @@ def _health_status(
 
 def _json(payload: JsonObject) -> str:
     return json.dumps(payload, sort_keys=True)
-
-
-def _iso(value: datetime) -> str:
-    return value.isoformat()
-
-
-def _optional_iso(value: datetime | None) -> str | None:
-    if value is None:
-        return None
-    return _iso(value)

@@ -8,6 +8,7 @@ CONFIG_ENV_VARS = [
     "PEOPLEBOOKS_USER_AGENT",
     "PEOPLEBOOKS_REQUEST_TIMEOUT_SECONDS",
     "PEOPLEBOOKS_SEARCH_TIMEOUT_SECONDS",
+    "PEOPLEBOOKS_TOOL_RESULT_MODE",
 ]
 
 
@@ -30,6 +31,7 @@ def test_default_config_contains_peopletools_862_peoplecode_seed() -> None:
     assert book.title == "PeopleCode API Reference"
     assert book.code == "tpcr"
     assert config.settings.search_timeout_seconds == 10.0
+    assert config.settings.tool_result_mode == "structured"
 
 
 def test_config_uses_environment_for_local_database_url(monkeypatch) -> None:
@@ -57,6 +59,7 @@ def test_config_file_overrides_runtime_settings(tmp_path: Path, monkeypatch) -> 
                 'user_agent = "PeopleBooksMCP test"',
                 "request_timeout_seconds = 12.5",
                 "search_timeout_seconds = 7.5",
+                'tool_result_mode = "compatible"',
             ]
         ),
         encoding="utf-8",
@@ -68,6 +71,32 @@ def test_config_file_overrides_runtime_settings(tmp_path: Path, monkeypatch) -> 
     assert config.settings.user_agent == "PeopleBooksMCP test"
     assert config.settings.request_timeout_seconds == 12.5
     assert config.settings.search_timeout_seconds == 7.5
+    assert config.settings.tool_result_mode == "compatible"
+
+
+def test_environment_overrides_tool_result_mode(monkeypatch) -> None:
+    clear_config_env(monkeypatch)
+    monkeypatch.setenv("PEOPLEBOOKS_TOOL_RESULT_MODE", "compatible")
+
+    config = load_config()
+
+    assert config.settings.tool_result_mode == "compatible"
+
+
+def test_invalid_tool_result_mode_is_rejected(tmp_path: Path, monkeypatch) -> None:
+    clear_config_env(monkeypatch)
+    settings_file = tmp_path / "peoplebooks.toml"
+    settings_file.write_text(
+        '[settings]\ntool_result_mode = "automatic"',
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(settings_file)
+    except ValueError as error:
+        assert str(error) == "tool_result_mode must be 'structured' or 'compatible'"
+    else:
+        raise AssertionError("Expected an invalid tool_result_mode to be rejected")
 
 
 def test_load_config_discovers_local_peoplebooks_toml(tmp_path: Path, monkeypatch) -> None:

@@ -4,15 +4,16 @@ import base64
 import binascii
 import hashlib
 import json
+import logging
 from collections.abc import Sequence
 from typing import Annotated, Any, Literal
 
 from mcp.server.fastmcp import FastMCP
-from mcp.types import CallToolResult, ToolAnnotations
+from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from psycopg.errors import UndefinedColumn
 from pydantic import BaseModel, ConfigDict, Field
 
-from peoplebooks_mcp.config import load_config
+from peoplebooks_mcp.config import ToolResultMode, load_config
 from peoplebooks_mcp.repositories import (
     EXPECTED_SCHEMA_REVISION,
     BookRecord,
@@ -25,6 +26,7 @@ from peoplebooks_mcp.repositories import (
 )
 
 JsonObject = dict[str, Any]
+logger = logging.getLogger(__name__)
 DetailLevel = Literal["compact", "normal", "full"]
 SearchMode = Literal["auto", "exact"]
 
@@ -127,7 +129,11 @@ class SearchDocsResponse(StrictModel):
 
 
 class FindPagesResponse(StrictModel):
-    pages: list[PageSearchPayload]
+    pages: list[PageSearchPayload] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    error: ErrorDetailPayload | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class PageDetailResponse(StrictModel):
@@ -161,18 +167,36 @@ class SectionDetailResponse(StrictModel):
 
 
 class ListBooksResponse(StrictModel):
-    version: VersionPayload
-    books: list[BookPayload]
+    version: VersionPayload | None = Field(default=None, exclude_if=lambda value: value is None)
+    books: list[BookPayload] | None = Field(default=None, exclude_if=lambda value: value is None)
+    error: ErrorDetailPayload | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
-def _structured_result(payload: JsonObject) -> CallToolResult:
-    return CallToolResult(content=[], structuredContent=payload)
+def _tool_result(
+    payload: JsonObject,
+    *,
+    mode: ToolResultMode,
+    is_error: bool = False,
+) -> CallToolResult:
+    content: list[TextContent] = []
+    if is_error:
+        error = payload.get("error", {})
+        message = str(error.get("message", "The tool call failed."))
+        content = [TextContent(type="text", text=message)]
+    elif mode == "compatible":
+        content = [TextContent(type="text", text=_json(payload))]
+    return CallToolResult(
+        content=content,
+        structuredContent=payload,
+        isError=is_error,
+    )
 
 
 def create_server(
     *,
     database_url: str | None = None,
     search_timeout_seconds: float | None = None,
+    tool_result_mode: ToolResultMode | None = None,
 ) -> FastMCP:
     settings = load_config().settings
     resolved_database_url = database_url or settings.database_url
@@ -181,6 +205,41 @@ def create_server(
         if search_timeout_seconds is None
         else search_timeout_seconds
     )
+    resolved_tool_result_mode = tool_result_mode or settings.tool_result_mode
+    if resolved_tool_result_mode not in {"structured", "compatible"}:
+        raise ValueError("tool_result_mode must be 'structured' or 'compatible'")
+
+    def tool_result(payload: JsonObject, *, is_error: bool = False) -> CallToolResult:
+        return _tool_result(
+            payload,
+            mode=resolved_tool_result_mode,
+            is_error=is_error,
+        )
+
+    def unknown_version_result(version: str) -> CallToolResult:
+        return tool_result(
+            _error_payload(
+                code="unknown_version",
+                message=(
+                    f"Unknown documentation version {version!r}. Use a configured version code "
+                    f"such as {DEFAULT_VERSION!r}."
+                ),
+            ),
+            is_error=True,
+        )
+
+    def database_error_result(tool_name: str) -> CallToolResult:
+        logger.exception("MCP tool %s failed due to an internal database error", tool_name)
+        return tool_result(
+            _error_payload(
+                code="database_error",
+                message=(
+                    "The documentation database operation failed. Check health and server logs, "
+                    "then retry."
+                ),
+            ),
+            is_error=True,
+        )
     server = FastMCP(
         "peoplebooks-mcp",
         instructions=(
@@ -209,14 +268,16 @@ def create_server(
         max_chars: int = DEFAULT_SEARCH_RESPONSE_CHARS,
     ) -> Annotated[CallToolResult, SearchDocsResponse]:
         """Use first for questions or code checks. Returns compact snippets and stable handles."""
-        with PeopleBooksRepository.connect(
-            resolved_database_url,
-            statement_timeout_seconds=resolved_search_timeout,
-        ) as repository:
-            doc_version = _require_doc_version(repository, version)
-            bounded_limit = _bounded_limit(limit)
-            bounded_max_chars = _bounded_search_response_chars(max_chars)
-            try:
+        try:
+            with PeopleBooksRepository.connect(
+                resolved_database_url,
+                statement_timeout_seconds=resolved_search_timeout,
+            ) as repository:
+                doc_version = repository.get_doc_version_by_code(version)
+                if doc_version is None:
+                    return unknown_version_result(version)
+                bounded_limit = _bounded_limit(limit)
+                bounded_max_chars = _bounded_search_response_chars(max_chars)
                 if search_mode == "exact":
                     results = repository.search_chunks_exact(
                         doc_version_id=doc_version.id,
@@ -244,23 +305,27 @@ def create_server(
                         page_id=page_id,
                     )
                     match_mode = "relaxed" if results else "none"
-            except UndefinedColumn:
-                return _structured_result(
-                    {
-                        "match": "error",
-                        "truncated": False,
-                        "results": [],
-                        "error": {
-                            "code": "schema_not_ready",
-                            "message": (
-                                "Search is unavailable because required chunk search columns are "
-                                "missing. Run Alembic migrations and re-index the corpus."
-                            ),
-                            "details": {"expected_revision": EXPECTED_SCHEMA_REVISION},
-                        },
-                    }
-                )
-        return _structured_result(
+        except UndefinedColumn:
+            logger.warning("Search schema is missing required columns", exc_info=True)
+            return tool_result(
+                {
+                    "match": "error",
+                    "truncated": False,
+                    "results": [],
+                    "error": {
+                        "code": "schema_not_ready",
+                        "message": (
+                            "Search is unavailable because required search columns are missing. "
+                            "Run Alembic migrations and re-index the corpus."
+                        ),
+                        "details": {"expected_revision": EXPECTED_SCHEMA_REVISION},
+                    },
+                },
+                is_error=True,
+            )
+        except Exception:
+            return database_error_result("search_docs")
+        return tool_result(
             _search_response_payload(
                 match=match_mode,
                 results=results,
@@ -279,15 +344,20 @@ def create_server(
         limit: int = 10,
     ) -> Annotated[CallToolResult, FindPagesResponse]:
         """Use to locate likely pages without spending tokens on section or chunk content."""
-        with PeopleBooksRepository.connect(resolved_database_url) as repository:
-            doc_version = _require_doc_version(repository, version)
-            pages = repository.find_pages(
-                doc_version_id=doc_version.id,
-                query=query,
-                book_code=book_code,
-                limit=_bounded_limit(limit),
-            )
-        return _structured_result(
+        try:
+            with PeopleBooksRepository.connect(resolved_database_url) as repository:
+                doc_version = repository.get_doc_version_by_code(version)
+                if doc_version is None:
+                    return unknown_version_result(version)
+                pages = repository.find_pages(
+                    doc_version_id=doc_version.id,
+                    query=query,
+                    book_code=book_code,
+                    limit=_bounded_limit(limit),
+                )
+        except Exception:
+            return database_error_result("find_pages")
+        return tool_result(
             {
                 "pages": [_page_search_payload(page) for page in pages],
             }
@@ -306,32 +376,38 @@ def create_server(
         max_level: int | None = None,
     ) -> Annotated[CallToolResult, PageDetailResponse]:
         """Use before get_section when only headings and section ids are needed."""
-        with PeopleBooksRepository.connect(resolved_database_url) as repository:
-            doc_version = _require_doc_version(repository, version)
-            page = _resolve_page_or_none(
-                repository,
-                doc_version=doc_version,
-                page_id=page_id,
-                normalized_path=normalized_path,
-            )
-            if page is None:
-                return _structured_result(
-                    _page_not_found_payload(
+        try:
+            with PeopleBooksRepository.connect(resolved_database_url) as repository:
+                doc_version = repository.get_doc_version_by_code(version)
+                if doc_version is None:
+                    return unknown_version_result(version)
+                page = _resolve_page_or_none(
+                    repository,
+                    doc_version=doc_version,
+                    page_id=page_id,
+                    normalized_path=normalized_path,
+                )
+                if page is None:
+                    return tool_result(
+                        _page_not_found_payload(
+                            repository,
+                            doc_version=doc_version,
+                            page_id=page_id,
+                            normalized_path=normalized_path,
+                        ),
+                        is_error=True,
+                    )
+                return tool_result(
+                    _page_outline_payload(
                         repository,
-                        doc_version=doc_version,
-                        page_id=page_id,
-                        normalized_path=normalized_path,
+                        page,
+                        limit=limit,
+                        offset=offset,
+                        max_level=max_level,
                     )
                 )
-            return _structured_result(
-                _page_outline_payload(
-                    repository,
-                    page,
-                    limit=limit,
-                    offset=offset,
-                    max_level=max_level,
-                )
-            )
+        except Exception:
+            return database_error_result("get_page_outline")
 
     @server.tool(
         annotations=read_only,
@@ -348,33 +424,48 @@ def create_server(
         cursor: str | None = None,
     ) -> Annotated[CallToolResult, SectionDetailResponse]:
         """Use after search_docs or get_page_outline. Returns paged Markdown without duplication."""
-        with PeopleBooksRepository.connect(resolved_database_url) as repository:
-            doc_version = _require_doc_version(repository, version)
-            try:
-                section = _resolve_section(
-                    repository,
-                    doc_version=doc_version,
-                    section_id=section_id,
-                    section_stable_id=section_stable_id,
-                    page_id=page_id,
-                    normalized_path=normalized_path,
-                )
-            except ValueError as error:
-                return _structured_result(
-                    _error_payload(code="section_not_found", message=str(error))
-                )
-            try:
-                return _structured_result(
-                    _section_detail_payload(
+        try:
+            with PeopleBooksRepository.connect(resolved_database_url) as repository:
+                doc_version = repository.get_doc_version_by_code(version)
+                if doc_version is None:
+                    return unknown_version_result(version)
+                try:
+                    section = _resolve_section(
                         repository,
-                        section,
-                        detail=detail,
-                        max_chars=max_chars,
-                        cursor=cursor,
+                        doc_version=doc_version,
+                        section_id=section_id,
+                        section_stable_id=section_stable_id,
+                        page_id=page_id,
+                        normalized_path=normalized_path,
                     )
-                )
-            except ValueError as error:
-                return _structured_result(_error_payload(code="invalid_cursor", message=str(error)))
+                except ValueError as error:
+                    return tool_result(
+                        _error_payload(
+                            code="section_not_found",
+                            message=(
+                                f"{error}. Use a section_id returned by search_docs or "
+                                "get_page_outline, then retry."
+                            ),
+                        ),
+                        is_error=True,
+                    )
+                try:
+                    return tool_result(
+                        _section_detail_payload(
+                            repository,
+                            section,
+                            detail=detail,
+                            max_chars=max_chars,
+                            cursor=cursor,
+                        )
+                    )
+                except ValueError as error:
+                    return tool_result(
+                        _error_payload(code="invalid_cursor", message=str(error)),
+                        is_error=True,
+                    )
+        except Exception:
+            return database_error_result("get_section")
 
     @server.tool(
         annotations=read_only,
@@ -382,10 +473,15 @@ def create_server(
     )
     def list_books(version: str = DEFAULT_VERSION) -> Annotated[CallToolResult, ListBooksResponse]:
         """List book codes for scoping later search_docs or find_pages calls."""
-        with PeopleBooksRepository.connect(resolved_database_url) as repository:
-            doc_version = _require_doc_version(repository, version)
-            books = repository.list_books(doc_version_id=doc_version.id)
-        return _structured_result(
+        try:
+            with PeopleBooksRepository.connect(resolved_database_url) as repository:
+                doc_version = repository.get_doc_version_by_code(version)
+                if doc_version is None:
+                    return unknown_version_result(version)
+                books = repository.list_books(doc_version_id=doc_version.id)
+        except Exception:
+            return database_error_result("list_books")
+        return tool_result(
             {
                 "version": _doc_version_payload(doc_version),
                 "books": [_book_payload(book) for book in books],
@@ -417,18 +513,23 @@ def create_server(
                     content=content,
                     doc_version_found=doc_version is not None,
                 )
-        except Exception as error:
-            return _structured_result(
+        except Exception:
+            logger.exception("MCP health tool could not access the documentation database")
+            return tool_result(
                 {
                     "status": "unavailable",
                     "error": {
                         "code": "database_unavailable",
-                        "message": str(error),
+                        "message": (
+                            "The documentation database is unavailable. Check connection settings "
+                            "and server logs, then retry."
+                        ),
                     },
-                }
+                },
+                is_error=True,
             )
 
-        return _structured_result(
+        return tool_result(
             {
                 "status": status,
                 "schema": {
@@ -1100,7 +1201,10 @@ def _page_not_found_payload(
     return {
         "error": {
             "code": "page_not_found",
-            "message": "No page matched the supplied identifier.",
+            "message": (
+                "No page matched the supplied identifier. Use a suggested page or call "
+                "find_pages, then retry with its page_id."
+            ),
             "page_id": page_id,
             "path": normalized_path,
         },

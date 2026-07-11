@@ -78,6 +78,59 @@ def test_mcp_structured_tools_do_not_duplicate_json_as_text_content(
         assert result.structuredContent
 
 
+def test_mcp_compatible_mode_serializes_structured_content_as_text(
+    postgres_url: str,
+) -> None:
+    run_migrations(postgres_url)
+    _seed_indexed_docs(postgres_url)
+    server = create_server(database_url=postgres_url, tool_result_mode="compatible")
+
+    result = _run(
+        server.call_tool("search_docs", {"version": "pt862", "query": "array object"})
+    )
+
+    assert not result.isError
+    assert len(result.content) == 1
+    assert result.content[0].type == "text"
+    assert json.loads(result.content[0].text) == result.structuredContent
+
+
+def test_mcp_unknown_version_is_an_actionable_tool_error(postgres_url: str) -> None:
+    run_migrations(postgres_url)
+    server = create_server(database_url=postgres_url)
+
+    result = _run(server.call_tool("list_books", {"version": "missing"}))
+
+    assert result.isError
+    assert result.structuredContent["error"]["code"] == "unknown_version"
+    assert "pt862" in result.content[0].text
+
+
+def test_mcp_internal_database_errors_are_logged_and_sanitized(monkeypatch) -> None:
+    secret = "postgresql://user:password@private-host/peoplebooks"
+    logged: list[tuple[Any, ...]] = []
+
+    def fail_connect(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(mcp_server_module.PeopleBooksRepository, "connect", fail_connect)
+    monkeypatch.setattr(
+        mcp_server_module.logger,
+        "exception",
+        lambda *args, **kwargs: logged.append((*args, kwargs)),
+    )
+    server = create_server(database_url="postgresql://example/unused")
+
+    result = _run(server.call_tool("health", {"version": "pt862"}))
+
+    assert result.isError
+    assert result.structuredContent["error"]["code"] == "database_unavailable"
+    assert secret not in json.dumps(result.structuredContent)
+    assert secret not in result.content[0].text
+    assert logged
+
+
 def test_mcp_search_docs_returns_lean_markup_free_results(postgres_url: str) -> None:
     run_migrations(postgres_url)
     ids = _seed_indexed_docs(postgres_url)
@@ -645,12 +698,16 @@ def test_mcp_get_page_outline_unknown_path_returns_structured_suggestions(
     ids = _seed_agent_workflow_docs(postgres_url)
     server = create_server(database_url=postgres_url)
 
-    result = _call_tool(
-        server,
-        "get_page_outline",
-        {"version": "pt862", "normalized_path": "tape.html"},
+    tool_result = _run(
+        server.call_tool(
+            "get_page_outline",
+            {"version": "pt862", "normalized_path": "tape.html"},
+        )
     )
+    result = tool_result.structuredContent
 
+    assert tool_result.isError
+    assert "find_pages" in tool_result.content[0].text
     assert result["error"]["code"] == "page_not_found"
     assert result["error"]["path"] == "tape.html"
     assert result["suggestions"][0]["page_id"] == ids["overview_page_id"]

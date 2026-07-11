@@ -4,13 +4,16 @@ import os
 import tomllib
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 DEFAULT_DATABASE_URL = "postgresql://peoplebooks:peoplebooks@localhost:5432/peoplebooks"
 DEFAULT_USER_AGENT = "PeopleBooksMCP/0.1.0"
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 20.0
 DEFAULT_SEARCH_TIMEOUT_SECONDS = 10.0
 DEFAULT_CONFIG_ENV = "PEOPLEBOOKS_CONFIG"
+DEFAULT_TOOL_RESULT_MODE = "structured"
+
+ToolResultMode = Literal["structured", "compatible"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,6 +22,7 @@ class RuntimeSettings:
     user_agent: str = DEFAULT_USER_AGENT
     request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
     search_timeout_seconds: float = DEFAULT_SEARCH_TIMEOUT_SECONDS
+    tool_result_mode: ToolResultMode = DEFAULT_TOOL_RESULT_MODE
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +118,8 @@ def _apply_environment_settings(settings: RuntimeSettings) -> RuntimeSettings:
         env_settings["request_timeout_seconds"] = timeout
     if timeout := os.environ.get("PEOPLEBOOKS_SEARCH_TIMEOUT_SECONDS"):
         env_settings["search_timeout_seconds"] = timeout
+    if tool_result_mode := os.environ.get("PEOPLEBOOKS_TOOL_RESULT_MODE"):
+        env_settings["tool_result_mode"] = tool_result_mode
 
     return _merge_settings(settings, env_settings)
 
@@ -124,6 +130,7 @@ def _merge_settings(settings: RuntimeSettings, overrides: dict[str, Any]) -> Run
         "user_agent",
         "request_timeout_seconds",
         "search_timeout_seconds",
+        "tool_result_mode",
     }
     unknown_keys = sorted(set(overrides) - accepted_keys)
     if unknown_keys:
@@ -137,5 +144,10 @@ def _merge_settings(settings: RuntimeSettings, overrides: dict[str, Any]) -> Run
         values["search_timeout_seconds"] = float(values["search_timeout_seconds"])
         if values["search_timeout_seconds"] <= 0:
             raise ValueError("search_timeout_seconds must be greater than zero")
+    if "tool_result_mode" in values and values["tool_result_mode"] not in {
+        "structured",
+        "compatible",
+    }:
+        raise ValueError("tool_result_mode must be 'structured' or 'compatible'")
 
     return replace(settings, **values)

@@ -29,6 +29,7 @@ Local overrides can be supplied with:
 - `PEOPLEBOOKS_USER_AGENT`
 - `PEOPLEBOOKS_REQUEST_TIMEOUT_SECONDS`
 - `PEOPLEBOOKS_SEARCH_TIMEOUT_SECONDS`
+- `PEOPLEBOOKS_TOOL_RESULT_MODE`
 
 Example:
 
@@ -38,6 +39,7 @@ database_url = "postgresql://peoplebooks:peoplebooks@localhost:5432/peoplebooks"
 user_agent = "PeopleBooksMCP/0.1.0"
 request_timeout_seconds = 20
 search_timeout_seconds = 10
+tool_result_mode = "structured"
 ```
 
 ## Database
@@ -132,8 +134,11 @@ Use the smallest useful result first:
 6. `get_section` returns one Markdown `content` page. If `next_cursor` is present,
    pass it back with the same section handle to retrieve the lossless continuation.
 
-Tool calls return data in `structuredContent`; the legacy text content block is
-left empty to avoid duplicating the JSON payload.
+Successful tool calls default to `tool_result_mode = "structured"`: data is returned in
+`structuredContent`, and the legacy text content block stays empty to avoid duplicating
+the JSON payload. Set the mode to `"compatible"` for older MCP clients that require the
+same payload serialized into a text content block. Tool failures set `isError = true` and
+always include a concise text recovery message as well as structured error details.
 
 For code-writing agents, start with `search_docs` using a focused PeopleCode term,
 method, class, property, or error phrase. Use `search_mode="exact"` when checking a

@@ -65,7 +65,9 @@
 - MCP is read-only; handlers never scrape live Oracle pages.
 - Tools: `health`, `search_docs`, `find_pages`, `get_page_outline`, `get_section`, `list_books`.
 - Resources expose versions, version books, paged book pages, pages, and sections.
-- Tool results put data in `structuredContent` and leave legacy text content empty.
+- Successful tool results default to structured-only output; compatible mode duplicates JSON as text.
+- Configure tool output with `tool_result_mode` or `PEOPLEBOOKS_TOOL_RESULT_MODE`.
+- Tool failures set `isError`, include concise recovery text, and hide internal exceptions.
 - Results are retrieval-oriented, compact by default, and omit raw HTML plus crawler/debug fields.
 - Search snippets are plain text without highlight markup.
 - Search defaults to five results with at most one result per page.

@@ -120,23 +120,12 @@ A better default result shape would be:
 }]
 }
 
-### 4. Make structured-only output an explicit compatibility policy
+### 4. Structured-only output compatibility policy — implemented
 
-The current _structured_result returns empty legacy content /C:
-/Users/BLeys/PycharmProjects/PeopleBooksMCP/src/peoplebooks_mcp/mcp_server.py:184. That eliminates duplication for
-modern clients, but the stable MCP specification says
-structured results should also include serialized text for backward compatibility. It also specifies that actionable
-tool failures should use isError: true. MCP tools specification
-(https://modelcontextprotocol.io/specification/2025-06-18/server/tools)
-
-Currently page/schema/database failures are often normal successful tool results containing an error property.
-
-Professional options:
-
-- Declare a minimum supported protocol/client matrix and integration-test structured-only responses.
-- Or provide structured-only and compatible server modes.
-- Return isError=true for recoverable tool errors, with concise recovery instructions.
-- Log internal database exceptions server-side; do not send raw exception strings to agents.
+Successful tools default to structured-only results to avoid duplicating JSON. Operators can set
+`tool_result_mode = "compatible"` or `PEOPLEBOOKS_TOOL_RESULT_MODE=compatible` for clients that require the structured
+payload serialized into legacy text content. Recoverable tool failures set `isError=true`, include concise recovery
+text and structured error details, and log internal database exceptions without exposing them to clients.
 
 ### 5. Fix the ingestion lifecycle
 

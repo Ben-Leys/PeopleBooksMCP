@@ -122,11 +122,15 @@ Use the smallest useful result first:
 
 1. `health` checks database, schema, parse, and index readiness.
 2. `list_books` finds book codes for scoping searches.
-3. `search_docs` answers most questions with compact snippets and stable handles.
+3. `search_docs` answers most questions with compact plain-text snippets and
+   `page_id`/`section_id` handles.
 4. `find_pages` locates likely pages without returning content.
 5. `get_page_outline` returns paged headings for one page.
 6. `get_section` returns compact section snippets by default; request
    `detail="full"` only when exact content is needed.
+
+Tool calls return data in `structuredContent`; the legacy text content block is
+left empty to avoid duplicating the JSON payload.
 
 For code-writing agents, start with `search_docs` using a focused PeopleCode term,
 method, class, property, or error phrase. Use `search_mode="exact"` when checking a

@@ -64,8 +64,10 @@
 - MCP is read-only; handlers never scrape live Oracle pages.
 - Tools: `health`, `search_docs`, `find_pages`, `get_page_outline`, `get_page`, `get_section`, `list_books`.
 - Resources expose versions, version books, book pages, pages, and sections.
+- Tool results put data in `structuredContent` and leave legacy text content empty.
 - Results are retrieval-oriented, compact by default, and omit raw HTML plus crawler/debug fields.
-- Useful results include version, book, page, section path, source URL, snippet, rank, and stable IDs.
+- Search snippets are plain text without highlight markup.
+- Useful search results include book, `page_id`, page title, `section_id`, section path, source URL, and snippet.
 - Prefer `search_docs` or `find_pages`, then returned `page_id`/`section_id`, instead of guessing page paths.
 - Use `search_docs(search_mode="exact")` for specific API, page, or heading lookups.
 - `search_docs` uses strict PostgreSQL full-text search first, then a bounded relaxed fallback when strict search returns no hits.

@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from mcp.server.fastmcp import FastMCP
-from mcp.types import ToolAnnotations
+from mcp.types import CallToolResult, ToolAnnotations
 from psycopg.errors import UndefinedColumn
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -50,13 +50,8 @@ class ErrorPayload(StrictModel):
 
 
 class VersionPayload(StrictModel):
-    id: int
     code: str
     label: str
-
-
-class SearchVersionPayload(StrictModel):
-    code: str
 
 
 class BookPayload(StrictModel):
@@ -80,7 +75,6 @@ class PagePayload(StrictModel):
 class SearchPagePayload(StrictModel):
     page_id: int
     title: str | None = None
-    normalized_path: str
     source_url: str
 
 
@@ -117,8 +111,6 @@ class ChunkPayload(StrictModel):
 
 
 class BudgetPayload(StrictModel):
-    detail: str
-    max_chars: int
     truncated: bool
 
 
@@ -130,14 +122,10 @@ class SearchSectionPayload(StrictModel):
 
 
 class SearchChunkPayload(StrictModel):
-    chunk_id: int
-    stable_id: str
     snippet: str
-    rank: float
 
 
 class SearchResultPayload(StrictModel):
-    version: SearchVersionPayload
     book: SearchBookPayload
     page: SearchPagePayload
     section: SearchSectionPayload
@@ -145,9 +133,7 @@ class SearchResultPayload(StrictModel):
 
 
 class SearchDocsResponse(StrictModel):
-    query: str
     match_mode: str
-    filters: JsonObject
     budget: BudgetPayload
     version: VersionPayload
     results: list[SearchResultPayload]
@@ -195,6 +181,10 @@ class ListBooksResponse(StrictModel):
     books: list[BookPayload]
 
 
+def _structured_result(payload: JsonObject) -> CallToolResult:
+    return CallToolResult(content=[], structuredContent=payload)
+
+
 def create_server(*, database_url: str | None = None) -> FastMCP:
     resolved_database_url = database_url or load_config().settings.database_url
     server = FastMCP(
@@ -223,7 +213,7 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
         page_id: int | None = None,
         search_mode: SearchMode = "auto",
         max_chars: int = DEFAULT_SNIPPET_CHARS,
-    ) -> SearchDocsResponse:
+    ) -> Annotated[CallToolResult, SearchDocsResponse]:
         """Use first for questions or code checks. Returns compact snippets and stable handles."""
         with PeopleBooksRepository.connect(resolved_database_url) as repository:
             doc_version = _require_doc_version(repository, version)
@@ -249,30 +239,24 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
                     )
                     match_mode = "strict"
             except UndefinedColumn:
-                return {
-                    "query": query,
-                    "match_mode": "error",
-                    "filters": {
-                        "book_code": book_code,
-                        "page_id": page_id,
-                        "search_mode": search_mode,
-                    },
-                    "budget": {
-                        "detail": "compact",
-                        "max_chars": bounded_max_chars,
-                        "truncated": False,
-                    },
-                    "version": _doc_version_payload(doc_version),
-                    "results": [],
-                    "error": {
-                        "code": "schema_not_ready",
-                        "message": (
-                            "Full-text search is unavailable because chunks.search_vector is "
-                            "missing. Run Alembic migrations and re-index the corpus."
-                        ),
-                        "details": {"expected_revision": EXPECTED_SCHEMA_REVISION},
-                    },
-                }
+                return _structured_result(
+                    {
+                        "match_mode": "error",
+                        "budget": {
+                            "truncated": False,
+                        },
+                        "version": _doc_version_payload(doc_version),
+                        "results": [],
+                        "error": {
+                            "code": "schema_not_ready",
+                            "message": (
+                                "Full-text search is unavailable because chunks.search_vector is "
+                                "missing. Run Alembic migrations and re-index the corpus."
+                            ),
+                            "details": {"expected_revision": EXPECTED_SCHEMA_REVISION},
+                        },
+                    }
+                )
             if search_mode == "auto" and not results:
                 results = repository.search_chunks_relaxed(
                     doc_version_id=doc_version.id,
@@ -286,22 +270,16 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
             results,
             max_chars=bounded_max_chars,
         )
-        return {
-            "query": query,
-            "match_mode": match_mode,
-            "filters": {
-                "book_code": book_code,
-                "page_id": page_id,
-                "search_mode": search_mode,
-            },
-            "budget": {
-                "detail": "compact",
-                "max_chars": bounded_max_chars,
-                "truncated": truncated,
-            },
-            "version": _doc_version_payload(doc_version),
-            "results": payloads,
-        }
+        return _structured_result(
+            {
+                "match_mode": match_mode,
+                "budget": {
+                    "truncated": truncated,
+                },
+                "version": _doc_version_payload(doc_version),
+                "results": payloads,
+            }
+        )
 
     @server.tool(
         annotations=read_only,
@@ -312,7 +290,7 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
         version: str = DEFAULT_VERSION,
         book_code: str | None = None,
         limit: int = 10,
-    ) -> FindPagesResponse:
+    ) -> Annotated[CallToolResult, FindPagesResponse]:
         """Use to locate likely pages without spending tokens on section or chunk content."""
         with PeopleBooksRepository.connect(resolved_database_url) as repository:
             doc_version = _require_doc_version(repository, version)
@@ -322,12 +300,14 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
                 book_code=book_code,
                 limit=_bounded_limit(limit),
             )
-        return {
-            "query": query,
-            "book_code": book_code,
-            "version": _doc_version_payload(doc_version),
-            "pages": [_page_search_payload(page) for page in pages],
-        }
+        return _structured_result(
+            {
+                "query": query,
+                "book_code": book_code,
+                "version": _doc_version_payload(doc_version),
+                "pages": [_page_search_payload(page) for page in pages],
+            }
+        )
 
     @server.tool(
         annotations=read_only,
@@ -340,7 +320,7 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
         limit: int = 50,
         offset: int = 0,
         max_level: int | None = None,
-    ) -> PageDetailResponse:
+    ) -> Annotated[CallToolResult, PageDetailResponse]:
         """Use after find_pages/search_docs to read compact, paged headings for one page."""
         with PeopleBooksRepository.connect(resolved_database_url) as repository:
             doc_version = _require_doc_version(repository, version)
@@ -351,18 +331,22 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
                 normalized_path=normalized_path,
             )
             if page is None:
-                return _page_not_found_payload(
-                    repository,
-                    doc_version=doc_version,
-                    page_id=page_id,
-                    normalized_path=normalized_path,
+                return _structured_result(
+                    _page_not_found_payload(
+                        repository,
+                        doc_version=doc_version,
+                        page_id=page_id,
+                        normalized_path=normalized_path,
+                    )
                 )
-            return _page_detail_payload(
-                repository,
-                page,
-                limit=limit,
-                offset=offset,
-                max_level=max_level,
+            return _structured_result(
+                _page_detail_payload(
+                    repository,
+                    page,
+                    limit=limit,
+                    offset=offset,
+                    max_level=max_level,
+                )
             )
 
     @server.tool(
@@ -376,7 +360,7 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
         limit: int = 50,
         offset: int = 0,
         max_level: int | None = None,
-    ) -> PageDetailResponse:
+    ) -> Annotated[CallToolResult, PageDetailResponse]:
         """Use before get_section when only headings and section ids are needed."""
         with PeopleBooksRepository.connect(resolved_database_url) as repository:
             doc_version = _require_doc_version(repository, version)
@@ -387,18 +371,22 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
                 normalized_path=normalized_path,
             )
             if page is None:
-                return _page_not_found_payload(
-                    repository,
-                    doc_version=doc_version,
-                    page_id=page_id,
-                    normalized_path=normalized_path,
+                return _structured_result(
+                    _page_not_found_payload(
+                        repository,
+                        doc_version=doc_version,
+                        page_id=page_id,
+                        normalized_path=normalized_path,
+                    )
                 )
-            return _page_outline_payload(
-                repository,
-                page,
-                limit=limit,
-                offset=offset,
-                max_level=max_level,
+            return _structured_result(
+                _page_outline_payload(
+                    repository,
+                    page,
+                    limit=limit,
+                    offset=offset,
+                    max_level=max_level,
+                )
             )
 
     @server.tool(
@@ -413,7 +401,7 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
         normalized_path: str | None = None,
         detail: DetailLevel = "compact",
         max_chars: int = DEFAULT_SECTION_CHARS,
-    ) -> SectionDetailResponse:
+    ) -> Annotated[CallToolResult, SectionDetailResponse]:
         """Use after search_docs or get_page_outline. Compact by default; full content is opt-in."""
         with PeopleBooksRepository.connect(resolved_database_url) as repository:
             doc_version = _require_doc_version(repository, version)
@@ -427,33 +415,39 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
                     normalized_path=normalized_path,
                 )
             except ValueError as error:
-                return _error_payload(code="section_not_found", message=str(error))
-            return _section_detail_payload(
-                repository,
-                section,
-                detail=detail,
-                max_chars=max_chars,
+                return _structured_result(
+                    _error_payload(code="section_not_found", message=str(error))
+                )
+            return _structured_result(
+                _section_detail_payload(
+                    repository,
+                    section,
+                    detail=detail,
+                    max_chars=max_chars,
+                )
             )
 
     @server.tool(
         annotations=read_only,
         structured_output=True,
     )
-    def list_books(version: str = DEFAULT_VERSION) -> ListBooksResponse:
+    def list_books(version: str = DEFAULT_VERSION) -> Annotated[CallToolResult, ListBooksResponse]:
         """List book codes for scoping later search_docs or find_pages calls."""
         with PeopleBooksRepository.connect(resolved_database_url) as repository:
             doc_version = _require_doc_version(repository, version)
             books = repository.list_books(doc_version_id=doc_version.id)
-        return {
-            "version": _doc_version_payload(doc_version),
-            "books": [_book_payload(book) for book in books],
-        }
+        return _structured_result(
+            {
+                "version": _doc_version_payload(doc_version),
+                "books": [_book_payload(book) for book in books],
+            }
+        )
 
     @server.tool(
         annotations=read_only,
         structured_output=True,
     )
-    def health(version: str = DEFAULT_VERSION) -> JsonObject:
+    def health(version: str = DEFAULT_VERSION) -> Annotated[CallToolResult, JsonObject]:
         """Report schema and index readiness for agent querying."""
         try:
             with PeopleBooksRepository.connect(resolved_database_url) as repository:
@@ -475,25 +469,29 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
                     doc_version_found=doc_version is not None,
                 )
         except Exception as error:
-            return {
-                "status": "unavailable",
-                "error": {
-                    "code": "database_unavailable",
-                    "message": str(error),
-                },
-            }
+            return _structured_result(
+                {
+                    "status": "unavailable",
+                    "error": {
+                        "code": "database_unavailable",
+                        "message": str(error),
+                    },
+                }
+            )
 
-        return {
-            "status": status,
-            "schema": {
-                "current_revision": schema_revision,
-                "expected_revision": EXPECTED_SCHEMA_REVISION,
-                "is_current": schema_is_current,
-                "missing_required_columns": missing_columns,
-            },
-            "version": _doc_version_payload(doc_version) if doc_version is not None else None,
-            "content": content,
-        }
+        return _structured_result(
+            {
+                "status": status,
+                "schema": {
+                    "current_revision": schema_revision,
+                    "expected_revision": EXPECTED_SCHEMA_REVISION,
+                    "is_current": schema_is_current,
+                    "missing_required_columns": missing_columns,
+                },
+                "version": _doc_version_payload(doc_version) if doc_version is not None else None,
+                "content": content,
+            }
+        )
 
     @server.resource(
         "peoplebooks://versions",
@@ -864,8 +862,6 @@ def _section_detail_payload(
         "section": section_payload,
         "chunks": chunk_payloads,
         "budget": {
-            "detail": detail,
-            "max_chars": bounded_max_chars,
             "truncated": text_truncated or chunk_truncated,
         },
     }
@@ -873,7 +869,6 @@ def _section_detail_payload(
 
 def _doc_version_payload(version: DocVersionRecord) -> JsonObject:
     return {
-        "id": version.id,
         "code": version.code,
         "label": version.label,
     }
@@ -963,9 +958,6 @@ def _chunk_payloads(
 
 def _search_result_payload(result: SearchResultRecord) -> JsonObject:
     return {
-        "version": {
-            "code": result.version_code,
-        },
         "book": {
             "code": result.book_code,
             "title": result.book_title,
@@ -973,7 +965,6 @@ def _search_result_payload(result: SearchResultRecord) -> JsonObject:
         "page": {
             "page_id": result.page_id,
             "title": result.page_title,
-            "normalized_path": result.normalized_path,
             "source_url": result.source_url,
         },
         "section": {
@@ -983,10 +974,7 @@ def _search_result_payload(result: SearchResultRecord) -> JsonObject:
             "section_path": result.section_path,
         },
         "chunk": {
-            "chunk_id": result.chunk_id,
-            "stable_id": result.chunk_stable_id,
             "snippet": result.snippet,
-            "rank": result.rank,
         },
     }
 
@@ -998,7 +986,7 @@ def _search_result_payloads(
 ) -> tuple[list[JsonObject], bool]:
     payloads: list[JsonObject] = []
     snippets, truncated_any = _truncate_texts_to_budget(
-        [result.snippet for result in results],
+        [_strip_search_markup(result.snippet) for result in results],
         max_chars=max_chars,
     )
     for result, snippet in zip(results, snippets, strict=False):
@@ -1006,6 +994,10 @@ def _search_result_payloads(
         payload["chunk"]["snippet"] = snippet
         payloads.append(payload)
     return payloads, truncated_any
+
+
+def _strip_search_markup(text: str) -> str:
+    return text.replace("<mark>", "").replace("</mark>", "")
 
 
 def _bounded_limit(limit: int) -> int:

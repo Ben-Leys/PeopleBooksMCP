@@ -30,12 +30,12 @@ def test_mcp_tools_return_indexed_docs_with_stable_ids(postgres_url: str) -> Non
     assert "source_metadata" not in books["books"][0]
     assert "created_at" not in books["books"][0]
 
-    assert search["results"][0]["version"]["code"] == "pt862"
+    assert "version" not in search["results"][0]
     assert search["results"][0]["book"]["code"] == "tpcr"
     assert search["results"][0]["page"]["page_id"] == ids["page_id"]
     assert search["results"][0]["page"]["source_url"].endswith("/createarray.html")
     assert search["results"][0]["section"]["stable_id"] == "createarray"
-    assert search["results"][0]["chunk"]["stable_id"] == "createarray-0"
+    assert set(search["results"][0]["chunk"]) == {"snippet"}
     assert "source_metadata" not in search["results"][0]["page"]
 
     assert page["page"]["id"] == ids["page_id"]
@@ -49,6 +49,55 @@ def test_mcp_tools_return_indexed_docs_with_stable_ids(postgres_url: str) -> Non
     assert section["section"]["stable_id"] == "createarray"
     assert section["chunks"][0]["stable_id"] == "createarray-0"
     assert "source_metadata" not in section["section"]
+
+
+def test_mcp_structured_tools_do_not_duplicate_json_as_text_content(
+    postgres_url: str,
+) -> None:
+    run_migrations(postgres_url)
+    ids = _seed_indexed_docs(postgres_url)
+    server = create_server(database_url=postgres_url)
+
+    search_result = _run(
+        server.call_tool("search_docs", {"version": "pt862", "query": "array object"})
+    )
+    section_result = _run(
+        server.call_tool("get_section", {"version": "pt862", "section_id": ids["section_id"]})
+    )
+
+    for result in [search_result, section_result]:
+        assert not isinstance(result, tuple)
+        assert result.content == []
+        assert result.structuredContent
+
+
+def test_mcp_search_docs_returns_lean_markup_free_results(postgres_url: str) -> None:
+    run_migrations(postgres_url)
+    ids = _seed_indexed_docs(postgres_url)
+    server = create_server(database_url=postgres_url)
+
+    result = _call_tool(
+        server,
+        "search_docs",
+        {
+            "version": "pt862",
+            "query": "array object",
+            "page_id": ids["page_id"],
+            "max_chars": 120,
+        },
+    )
+
+    assert "query" not in result
+    assert "filters" not in result
+    assert "id" not in result["version"]
+    assert set(result["budget"]) == {"truncated"}
+
+    item = result["results"][0]
+    assert "version" not in item
+    assert "normalized_path" not in item["page"]
+    assert set(item["chunk"]) == {"snippet"}
+    assert "<mark>" not in item["chunk"]["snippet"]
+    assert "</mark>" not in item["chunk"]["snippet"]
 
 
 def test_mcp_resources_expose_versions_books_pages_and_sections(postgres_url: str) -> None:
@@ -123,12 +172,11 @@ def test_mcp_get_section_defaults_to_compact_budget_and_full_detail_is_opt_in(
     assert "content" not in compact["chunks"][0]
     assert compact["chunks"][0]["snippet"].endswith("...")
     assert len(compact["chunks"][0]["snippet"]) <= 93
-    assert compact["budget"]["detail"] == "compact"
     assert compact["budget"]["truncated"] is True
 
     assert full["section"]["content"].startswith("Application classes can expose")
     assert full["chunks"][0]["content"].startswith("Application classes can expose")
-    assert full["budget"]["detail"] == "full"
+    assert full["budget"]["truncated"] is False
 
 
 def test_mcp_tools_and_resources_never_expose_raw_html(postgres_url: str) -> None:
@@ -341,7 +389,6 @@ def test_mcp_search_docs_page_id_filter_scopes_results(postgres_url: str) -> Non
     )
 
     assert result["match_mode"] == "strict"
-    assert result["filters"]["page_id"] == ids["overview_page_id"]
     assert {item["page"]["page_id"] for item in result["results"]} == {ids["overview_page_id"]}
 
 
@@ -363,7 +410,6 @@ def test_mcp_search_docs_respects_snippet_budget(postgres_url: str) -> None:
 
     snippet = result["results"][0]["chunk"]["snippet"]
     assert len(snippet) <= 83
-    assert result["budget"]["max_chars"] == 80
     assert result["budget"]["truncated"] is True
 
 
@@ -530,7 +576,7 @@ def test_mcp_tool_metadata_has_specific_output_schemas_and_workflow_descriptions
     section_schema = tools["get_section"].outputSchema
     assert search_schema["properties"]["results"]["type"] == "array"
     budget_schema = _schema_property(section_schema, "budget")
-    assert budget_schema["properties"]["detail"]["type"] == "string"
+    assert set(budget_schema["properties"]) == {"truncated"}
     assert search_schema.get("additionalProperties") is not True
     assert tools["get_page"].outputSchema.get("additionalProperties") is not True
     assert tools["get_page_outline"].outputSchema.get("additionalProperties") is not True
@@ -543,8 +589,11 @@ def _run[T](awaitable: Awaitable[T]) -> T:
 
 
 def _call_tool(server: Any, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    _content, structured_content = _run(server.call_tool(name, arguments))
-    return structured_content
+    result = _run(server.call_tool(name, arguments))
+    if isinstance(result, tuple):
+        _content, structured_content = result
+        return structured_content
+    return result.structuredContent
 
 
 def _read_json_resource(server: Any, uri: str) -> dict[str, Any]:

@@ -63,19 +63,21 @@
 ## MCP
 
 - MCP is read-only; handlers never scrape live Oracle pages.
-- Tools: `health`, `search_docs`, `find_pages`, `get_page_outline`, `get_page`, `get_section`, `list_books`.
-- Resources expose versions, version books, book pages, pages, and sections.
+- Tools: `health`, `search_docs`, `find_pages`, `get_page_outline`, `get_section`, `list_books`.
+- Resources expose versions, version books, paged book pages, pages, and sections.
 - Tool results put data in `structuredContent` and leave legacy text content empty.
 - Results are retrieval-oriented, compact by default, and omit raw HTML plus crawler/debug fields.
 - Search snippets are plain text without highlight markup.
-- Useful search results include book, `page_id`, page title, `section_id`, section path, source URL, and snippet.
+- Search defaults to five results with at most one result per page.
+- Search results are flat and include `book_code`, `page_id`, title, `section_id`, relative path, source URL, and snippet.
 - Prefer `search_docs` or `find_pages`, then returned `page_id`/`section_id`, instead of guessing page paths.
 - Use `search_docs(search_mode="exact")` for specific API, page, or heading lookups.
 - `search_docs` uses strict English FTS first, then bounded OR-style English/simple FTS plus trigram reranking and page diversification.
 - `search_docs` database work has a configurable 10-second default statement timeout.
 - Use `get_page_outline` for paged headings before requesting body text with `get_section`.
-- `search_docs` and `get_section` support `max_chars`.
+- `search_docs.max_chars` budgets its complete serialized response; `get_section.max_chars` budgets content.
 - `get_section` returns one Markdown `content` field and an opaque `next_cursor` for lossless continuation.
+- Book-page resources return at most 100 pages plus a `next_uri` continuation.
 - `health` reports schema revision, required search columns, and parsed/indexed content readiness.
 
 ## Testing

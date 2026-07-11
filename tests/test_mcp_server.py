@@ -5,6 +5,7 @@ import json
 from collections.abc import Awaitable
 from typing import Any
 
+import peoplebooks_mcp.mcp_server as mcp_server_module
 from peoplebooks_mcp.database import run_migrations
 from peoplebooks_mcp.indexing import index_pages
 from peoplebooks_mcp.mcp_server import create_server
@@ -18,7 +19,11 @@ def test_mcp_tools_return_indexed_docs_with_stable_ids(postgres_url: str) -> Non
 
     books = _call_tool(server, "list_books", {"version": "pt862"})
     search = _call_tool(server, "search_docs", {"version": "pt862", "query": "array object"})
-    page = _call_tool(server, "get_page", {"version": "pt862", "page_id": ids["page_id"]})
+    page = _call_tool(
+        server,
+        "get_page_outline",
+        {"version": "pt862", "page_id": ids["page_id"]},
+    )
     section = _call_tool(
         server,
         "get_section",
@@ -30,13 +35,13 @@ def test_mcp_tools_return_indexed_docs_with_stable_ids(postgres_url: str) -> Non
     assert "source_metadata" not in books["books"][0]
     assert "created_at" not in books["books"][0]
 
-    assert "version" not in search["results"][0]
-    assert search["results"][0]["book"]["code"] == "tpcr"
-    assert search["results"][0]["page"]["page_id"] == ids["page_id"]
-    assert search["results"][0]["page"]["source_url"].endswith("/createarray.html")
-    assert search["results"][0]["section"]["stable_id"] == "createarray"
-    assert set(search["results"][0]["chunk"]) == {"snippet"}
-    assert "source_metadata" not in search["results"][0]["page"]
+    assert "version" not in search
+    assert search["results"][0]["book_code"] == "tpcr"
+    assert search["results"][0]["page_id"] == ids["page_id"]
+    assert search["results"][0]["source_url"].endswith("/createarray.html")
+    assert search["results"][0]["section_stable_id"] == "createarray"
+    assert "chunk" not in search["results"][0]
+    assert "source_metadata" not in search["results"][0]
 
     assert page["page"]["id"] == ids["page_id"]
     assert page["page"]["normalized_path"].endswith("/createarray.html")
@@ -85,21 +90,29 @@ def test_mcp_search_docs_returns_lean_markup_free_results(postgres_url: str) -> 
             "version": "pt862",
             "query": "array object",
             "page_id": ids["page_id"],
-            "max_chars": 120,
+            "max_chars": 500,
         },
     )
 
     assert "query" not in result
     assert "filters" not in result
-    assert "id" not in result["version"]
-    assert set(result["budget"]) == {"truncated"}
+    assert "version" not in result
+    assert set(result) == {"match", "truncated", "results"}
+    assert len(json.dumps(result, sort_keys=True)) <= 500
 
     item = result["results"][0]
-    assert "version" not in item
-    assert "normalized_path" not in item["page"]
-    assert set(item["chunk"]) == {"snippet"}
-    assert "<mark>" not in item["chunk"]["snippet"]
-    assert "</mark>" not in item["chunk"]["snippet"]
+    assert set(item) == {
+        "book_code",
+        "page_id",
+        "title",
+        "section_id",
+        "section_stable_id",
+        "path",
+        "snippet",
+        "source_url",
+    }
+    assert "<mark>" not in item["snippet"]
+    assert "</mark>" not in item["snippet"]
 
 
 def test_mcp_resources_expose_versions_books_pages_and_sections(postgres_url: str) -> None:
@@ -120,11 +133,40 @@ def test_mcp_resources_expose_versions_books_pages_and_sections(postgres_url: st
     assert books["books"][0]["code"] == "tpcr"
     assert pages["pages"][0]["id"] == ids["page_id"]
     assert pages["pages"][0]["title"] == "CreateArray"
+    assert pages["offset"] == 0
+    assert pages["returned_count"] == 1
+    assert pages["next_uri"] is None
     assert page["sections"][0]["stable_id"] == "createarray"
     assert "source_metadata" not in page["sections"][0]
     assert "chunks" not in page["sections"][0]
     assert section["section"]["stable_id"] == "createarray"
     assert "source_metadata" not in section["section"]
+
+
+def test_mcp_book_pages_resource_supports_continuation_uris(
+    postgres_url: str,
+    monkeypatch: Any,
+) -> None:
+    run_migrations(postgres_url)
+    _seed_many_search_result_docs(postgres_url)
+    monkeypatch.setattr(mcp_server_module, "BOOK_PAGES_RESOURCE_LIMIT", 2)
+    server = create_server(database_url=postgres_url)
+
+    first = _read_json_resource(
+        server,
+        "peoplebooks://versions/pt862/books/tpcr/pages",
+    )
+    second = _read_json_resource(server, first["next_uri"])
+
+    assert first["offset"] == 0
+    assert first["returned_count"] == 2
+    assert first["next_uri"].endswith("/pages/2")
+    assert second["offset"] == 2
+    assert second["returned_count"] == 2
+    assert second["next_uri"].endswith("/pages/4")
+    assert {page["id"] for page in first["pages"]}.isdisjoint(
+        page["id"] for page in second["pages"]
+    )
 
 
 def test_mcp_tool_can_get_section_by_page_path_and_stable_id(postgres_url: str) -> None:
@@ -224,7 +266,6 @@ def test_mcp_tools_and_resources_never_expose_raw_html(postgres_url: str) -> Non
         _call_tool(server, "list_books", {"version": "pt862"}),
         _call_tool(server, "search_docs", {"version": "pt862", "query": "application class"}),
         _call_tool(server, "find_pages", {"version": "pt862", "query": "application class"}),
-        _call_tool(server, "get_page", {"version": "pt862", "page_id": ids["page_id"]}),
         _call_tool(server, "get_page_outline", {"version": "pt862", "page_id": ids["page_id"]}),
         _call_tool(server, "get_section", {"version": "pt862", "section_id": ids["section_id"]}),
         _call_tool(server, "health", {"version": "pt862"}),
@@ -284,8 +325,7 @@ def test_mcp_find_pages_returns_bounded_thin_candidates(postgres_url: str) -> No
         },
     )
 
-    assert result["query"] == "Application Engine state records"
-    assert result["book_code"] == "tape"
+    assert set(result) == {"pages"}
     assert len(result["pages"]) <= 2
     assert result["pages"][0]["page_id"] == ids["state_records_page_id"]
     assert result["pages"][0]["title"] == "Using State Records"
@@ -356,31 +396,6 @@ def test_mcp_get_page_outline_can_page_and_filter_heading_levels(postgres_url: s
     assert [section["level"] for section in h1_only["sections"]] == [1]
 
 
-def test_mcp_get_page_returns_paged_compact_headings(postgres_url: str) -> None:
-    run_migrations(postgres_url)
-    ids = _seed_agent_workflow_docs(postgres_url)
-    server = create_server(database_url=postgres_url)
-
-    result = _call_tool(
-        server,
-        "get_page",
-        {
-            "version": "pt862",
-            "page_id": ids["program_elements_page_id"],
-            "limit": 1,
-        },
-    )
-
-    assert result["section_count"] == 2
-    assert result["returned_count"] == 1
-    assert result["next_offset"] == 1
-    assert [section["heading"] for section in result["sections"]] == [
-        "Application Engine Program Elements",
-    ]
-    assert "content" not in result["sections"][0]
-    assert "chunks" not in result["sections"][0]
-
-
 def test_mcp_search_docs_uses_relaxed_fallback_for_over_specific_queries(
     postgres_url: str,
 ) -> None:
@@ -402,10 +417,10 @@ def test_mcp_search_docs_uses_relaxed_fallback_for_over_specific_queries(
         },
     )
 
-    assert result["match_mode"] == "relaxed"
-    assert result["results"][0]["page"]["page_id"] == ids["state_records_page_id"]
-    assert result["results"][0]["book"]["code"] == "tape"
-    assert "state records" in result["results"][0]["chunk"]["snippet"].lower()
+    assert result["match"] == "relaxed"
+    assert result["results"][0]["page_id"] == ids["state_records_page_id"]
+    assert result["results"][0]["book_code"] == "tape"
+    assert "state records" in result["results"][0]["snippet"].lower()
 
 
 def test_mcp_search_docs_page_id_filter_scopes_results(postgres_url: str) -> None:
@@ -424,11 +439,11 @@ def test_mcp_search_docs_page_id_filter_scopes_results(postgres_url: str) -> Non
         },
     )
 
-    assert result["match_mode"] == "strict"
-    assert {item["page"]["page_id"] for item in result["results"]} == {ids["overview_page_id"]}
+    assert result["match"] == "strict"
+    assert {item["page_id"] for item in result["results"]} == {ids["overview_page_id"]}
 
 
-def test_mcp_search_docs_respects_snippet_budget(postgres_url: str) -> None:
+def test_mcp_search_docs_respects_complete_response_budget(postgres_url: str) -> None:
     run_migrations(postgres_url)
     ids = _seed_agent_workflow_docs(postgres_url)
     server = create_server(database_url=postgres_url)
@@ -440,16 +455,16 @@ def test_mcp_search_docs_respects_snippet_budget(postgres_url: str) -> None:
             "version": "pt862",
             "query": "Application Engine rare tail marker",
             "page_id": ids["long_tail_page_id"],
-            "max_chars": 80,
+            "max_chars": 500,
         },
     )
 
-    snippet = result["results"][0]["chunk"]["snippet"]
-    assert len(snippet) <= 83
-    assert result["budget"]["truncated"] is True
+    assert result["results"]
+    assert len(json.dumps(result, sort_keys=True)) <= 500
+    assert result["truncated"] is True
 
 
-def test_mcp_search_docs_budget_applies_across_all_returned_snippets(
+def test_mcp_search_docs_defaults_to_five_results_and_budgets_the_full_response(
     postgres_url: str,
 ) -> None:
     run_migrations(postgres_url)
@@ -462,15 +477,13 @@ def test_mcp_search_docs_budget_applies_across_all_returned_snippets(
         {
             "version": "pt862",
             "query": "BudgetTerm",
-            "limit": 5,
-            "max_chars": 120,
+            "max_chars": 1600,
         },
     )
 
-    snippets = [item["chunk"]["snippet"] for item in result["results"]]
-    assert len(snippets) > 1
-    assert sum(len(snippet) for snippet in snippets) <= 120
-    assert result["budget"]["truncated"] is True
+    assert len(result["results"]) == 5
+    assert len({item["page_id"] for item in result["results"]}) == 5
+    assert len(json.dumps(result, sort_keys=True)) <= 1600
 
 
 def test_mcp_get_section_does_not_expose_internal_search_chunks(postgres_url: str) -> None:
@@ -508,9 +521,9 @@ def test_mcp_search_docs_exact_mode_prefers_title_and_heading_matches(
         },
     )
 
-    assert result["match_mode"] == "exact"
-    assert result["results"][0]["page"]["page_id"] == ids["program_elements_page_id"]
-    assert result["results"][0]["section"]["heading"] == "Application Engine Program Elements"
+    assert result["match"] == "exact"
+    assert result["results"][0]["page_id"] == ids["program_elements_page_id"]
+    assert result["results"][0]["path"] == []
 
 
 def test_mcp_search_docs_exact_mode_treats_peoplecode_wildcards_literally(
@@ -531,7 +544,7 @@ def test_mcp_search_docs_exact_mode_treats_peoplecode_wildcards_literally(
         },
     )
 
-    assert {item["page"]["page_id"] for item in result["results"]} == {ids["percent_this_page_id"]}
+    assert {item["page_id"] for item in result["results"]} == {ids["percent_this_page_id"]}
 
 
 def test_mcp_search_docs_exact_mode_returns_diverse_page_candidates(
@@ -552,7 +565,27 @@ def test_mcp_search_docs_exact_mode_returns_diverse_page_candidates(
         },
     )
 
-    assert [item["page"]["page_id"] for item in result["results"]] == [
+    assert [item["page_id"] for item in result["results"]] == [
+        ids["do_stuff_page_id"],
+        ids["do_stuff_example_page_id"],
+    ]
+
+
+def test_mcp_search_docs_strict_mode_returns_diverse_page_candidates(
+    postgres_url: str,
+) -> None:
+    run_migrations(postgres_url)
+    ids = _seed_exact_diversity_docs(postgres_url)
+    server = create_server(database_url=postgres_url)
+
+    result = _call_tool(
+        server,
+        "search_docs",
+        {"version": "pt862", "query": "DoStuff", "limit": 2},
+    )
+
+    assert result["match"] == "strict"
+    assert [item["page_id"] for item in result["results"]] == [
         ids["do_stuff_page_id"],
         ids["do_stuff_example_page_id"],
     ]
@@ -575,8 +608,8 @@ def test_mcp_search_docs_relaxed_mode_uses_trigrams_and_diversifies_pages(
         },
     )
 
-    assert result["match_mode"] == "relaxed"
-    assert {item["page"]["page_id"] for item in result["results"]} == {
+    assert result["match"] == "relaxed"
+    assert {item["page_id"] for item in result["results"]} == {
         ids["do_stuff_page_id"],
         ids["do_stuff_example_page_id"],
     }
@@ -598,21 +631,23 @@ def test_mcp_search_docs_relaxed_snippet_is_near_matched_terms(postgres_url: str
         },
     )
 
-    assert result["match_mode"] == "relaxed"
-    assert result["results"][0]["page"]["page_id"] == ids["long_tail_page_id"]
-    snippet = result["results"][0]["chunk"]["snippet"].lower()
+    assert result["match"] == "relaxed"
+    assert result["results"][0]["page_id"] == ids["long_tail_page_id"]
+    snippet = result["results"][0]["snippet"].lower()
     assert "rare tail marker" in snippet
     assert len(snippet) < 520
 
 
-def test_mcp_get_page_unknown_path_returns_structured_suggestions(postgres_url: str) -> None:
+def test_mcp_get_page_outline_unknown_path_returns_structured_suggestions(
+    postgres_url: str,
+) -> None:
     run_migrations(postgres_url)
     ids = _seed_agent_workflow_docs(postgres_url)
     server = create_server(database_url=postgres_url)
 
     result = _call_tool(
         server,
-        "get_page",
+        "get_page_outline",
         {"version": "pt862", "normalized_path": "tape.html"},
     )
 
@@ -638,8 +673,9 @@ def test_mcp_tool_metadata_has_specific_output_schemas_and_workflow_descriptions
     assert "next_cursor" in section_schema["properties"]
     assert "chunks" not in section_schema["properties"]
     assert search_schema.get("additionalProperties") is not True
-    assert tools["get_page"].outputSchema.get("additionalProperties") is not True
+    assert "get_page" not in tools
     assert tools["get_page_outline"].outputSchema.get("additionalProperties") is not True
+    assert tools["search_docs"].inputSchema["properties"]["limit"]["default"] == 5
     assert "Use first for questions" in tools["search_docs"].description
     assert "Use after search_docs or get_page_outline" in tools["get_section"].description
 

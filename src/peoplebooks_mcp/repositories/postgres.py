@@ -654,7 +654,16 @@ class PeopleBooksRepository:
         ).fetchall()
         return [_record(PageRecord, row) for row in rows]
 
-    def list_pages_for_book(self, *, doc_version_id: int, book_id: int) -> list[PageRecord]:
+    def list_pages_for_book(
+        self,
+        *,
+        doc_version_id: int,
+        book_id: int,
+        limit: int,
+        offset: int = 0,
+    ) -> list[PageRecord]:
+        bounded_limit = max(1, min(limit, 101))
+        bounded_offset = max(0, offset)
         rows = self._connection.execute(
             f"""
             SELECT {PAGE_METADATA_COLUMNS}
@@ -662,8 +671,10 @@ class PeopleBooksRepository:
             WHERE doc_version_id = %s
               AND book_id = %s
             ORDER BY normalized_path, id
+            LIMIT %s
+            OFFSET %s
             """,
-            (doc_version_id, book_id),
+            (doc_version_id, book_id, bounded_limit, bounded_offset),
         ).fetchall()
         return [_record(PageRecord, row) for row in rows]
 
@@ -1325,40 +1336,70 @@ class PeopleBooksRepository:
             WITH search_query AS (
                 SELECT websearch_to_tsquery('english', %s) AS query
             )
+            , ranked AS (
+                SELECT
+                    dv.code AS version_code,
+                    dv.label AS version_label,
+                    b.code AS book_code,
+                    b.title AS book_title,
+                    p.id AS page_id,
+                    p.title AS page_title,
+                    p.normalized_path AS normalized_path,
+                    p.source_url AS source_url,
+                    p.source_metadata AS page_source_metadata,
+                    s.id AS section_id,
+                    s.stable_id AS section_stable_id,
+                    s.heading AS section_heading,
+                    s.section_path AS section_path,
+                    c.id AS chunk_id,
+                    c.stable_id AS chunk_stable_id,
+                    ts_headline(
+                        'english',
+                        c.content,
+                        search_query.query,
+                        'StartSel=<mark>, StopSel=</mark>, MaxWords=35, MinWords=8, ShortWord=3'
+                    ) AS snippet,
+                    ts_rank_cd(c.search_vector, search_query.query)::float8 AS rank,
+                    row_number() OVER (
+                        PARTITION BY p.id
+                        ORDER BY
+                            ts_rank_cd(c.search_vector, search_query.query) DESC,
+                            s.ordinal,
+                            c.ordinal,
+                            c.id
+                    ) AS page_rank
+                FROM chunks AS c
+                JOIN pages AS p ON p.id = c.page_id
+                JOIN books AS b ON b.id = p.book_id
+                JOIN doc_versions AS dv ON dv.id = p.doc_version_id
+                JOIN sections AS s ON s.id = c.section_id
+                CROSS JOIN search_query
+                WHERE p.doc_version_id = %s
+                  AND (%s::text IS NULL OR b.code = %s)
+                  AND (%s::bigint IS NULL OR p.id = %s)
+                  AND c.search_vector @@ search_query.query
+            )
             SELECT
-                dv.code AS version_code,
-                dv.label AS version_label,
-                b.code AS book_code,
-                b.title AS book_title,
-                p.id AS page_id,
-                p.title AS page_title,
-                p.normalized_path AS normalized_path,
-                p.source_url AS source_url,
-                p.source_metadata AS page_source_metadata,
-                s.id AS section_id,
-                s.stable_id AS section_stable_id,
-                s.heading AS section_heading,
-                s.section_path AS section_path,
-                c.id AS chunk_id,
-                c.stable_id AS chunk_stable_id,
-                ts_headline(
-                    'english',
-                    c.content,
-                    search_query.query,
-                    'StartSel=<mark>, StopSel=</mark>, MaxWords=35, MinWords=8, ShortWord=3'
-                ) AS snippet,
-                ts_rank_cd(c.search_vector, search_query.query)::float8 AS rank
-            FROM chunks AS c
-            JOIN pages AS p ON p.id = c.page_id
-            JOIN books AS b ON b.id = p.book_id
-            JOIN doc_versions AS dv ON dv.id = p.doc_version_id
-            JOIN sections AS s ON s.id = c.section_id
-            CROSS JOIN search_query
-            WHERE p.doc_version_id = %s
-              AND (%s::text IS NULL OR b.code = %s)
-              AND (%s::bigint IS NULL OR p.id = %s)
-              AND c.search_vector @@ search_query.query
-            ORDER BY rank DESC, p.id, s.ordinal, c.ordinal, c.id
+                version_code,
+                version_label,
+                book_code,
+                book_title,
+                page_id,
+                page_title,
+                normalized_path,
+                source_url,
+                page_source_metadata,
+                section_id,
+                section_stable_id,
+                section_heading,
+                section_path,
+                chunk_id,
+                chunk_stable_id,
+                snippet,
+                rank
+            FROM ranked
+            WHERE page_rank = 1
+            ORDER BY rank DESC, page_id, section_id, chunk_id
             LIMIT %s
             """,
             (search_text, doc_version_id, book_code, book_code, page_id, page_id, limit),

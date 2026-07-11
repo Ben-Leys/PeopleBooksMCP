@@ -30,9 +30,10 @@ SearchMode = Literal["auto", "exact"]
 
 DEFAULT_VERSION = "pt862"
 JSON_MIME_TYPE = "application/json"
-DEFAULT_SNIPPET_CHARS = 450
+DEFAULT_SEARCH_RESPONSE_CHARS = 4000
 DEFAULT_SECTION_CHARS = 1200
 MAX_RESPONSE_CHARS = 8000
+BOOK_PAGES_RESOURCE_LIMIT = 100
 
 
 class StrictModel(BaseModel):
@@ -107,36 +108,25 @@ class BudgetPayload(StrictModel):
     truncated: bool
 
 
-class SearchSectionPayload(StrictModel):
-    section_id: int
-    stable_id: str
-    heading: str
-    section_path: list[str]
-
-
-class SearchChunkPayload(StrictModel):
-    snippet: str
-
-
 class SearchResultPayload(StrictModel):
-    book: SearchBookPayload
-    page: SearchPagePayload
-    section: SearchSectionPayload
-    chunk: SearchChunkPayload
+    book_code: str
+    page_id: int
+    title: str | None = None
+    section_id: int
+    section_stable_id: str
+    path: list[str]
+    snippet: str
+    source_url: str
 
 
 class SearchDocsResponse(StrictModel):
-    match_mode: str
-    budget: BudgetPayload
-    version: VersionPayload
+    match: str
+    truncated: bool
     results: list[SearchResultPayload]
     error: ErrorDetailPayload | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class FindPagesResponse(StrictModel):
-    query: str
-    book_code: str | None
-    version: VersionPayload
     pages: list[PageSearchPayload]
 
 
@@ -212,11 +202,11 @@ def create_server(
     def search_docs(
         query: str,
         version: str = DEFAULT_VERSION,
-        limit: int = 10,
+        limit: int = 5,
         book_code: str | None = None,
         page_id: int | None = None,
         search_mode: SearchMode = "auto",
-        max_chars: int = DEFAULT_SNIPPET_CHARS,
+        max_chars: int = DEFAULT_SEARCH_RESPONSE_CHARS,
     ) -> Annotated[CallToolResult, SearchDocsResponse]:
         """Use first for questions or code checks. Returns compact snippets and stable handles."""
         with PeopleBooksRepository.connect(
@@ -225,7 +215,7 @@ def create_server(
         ) as repository:
             doc_version = _require_doc_version(repository, version)
             bounded_limit = _bounded_limit(limit)
-            bounded_max_chars = _bounded_max_chars(max_chars, default=DEFAULT_SNIPPET_CHARS)
+            bounded_max_chars = _bounded_search_response_chars(max_chars)
             try:
                 if search_mode == "exact":
                     results = repository.search_chunks_exact(
@@ -257,11 +247,8 @@ def create_server(
             except UndefinedColumn:
                 return _structured_result(
                     {
-                        "match_mode": "error",
-                        "budget": {
-                            "truncated": False,
-                        },
-                        "version": _doc_version_payload(doc_version),
+                        "match": "error",
+                        "truncated": False,
                         "results": [],
                         "error": {
                             "code": "schema_not_ready",
@@ -273,19 +260,12 @@ def create_server(
                         },
                     }
                 )
-        payloads, truncated = _search_result_payloads(
-            results,
-            max_chars=bounded_max_chars,
-        )
         return _structured_result(
-            {
-                "match_mode": match_mode,
-                "budget": {
-                    "truncated": truncated,
-                },
-                "version": _doc_version_payload(doc_version),
-                "results": payloads,
-            }
+            _search_response_payload(
+                match=match_mode,
+                results=results,
+                max_chars=bounded_max_chars,
+            )
         )
 
     @server.tool(
@@ -309,52 +289,9 @@ def create_server(
             )
         return _structured_result(
             {
-                "query": query,
-                "book_code": book_code,
-                "version": _doc_version_payload(doc_version),
                 "pages": [_page_search_payload(page) for page in pages],
             }
         )
-
-    @server.tool(
-        annotations=read_only,
-        structured_output=True,
-    )
-    def get_page(
-        version: str = DEFAULT_VERSION,
-        page_id: int | None = None,
-        normalized_path: str | None = None,
-        limit: int = 50,
-        offset: int = 0,
-        max_level: int | None = None,
-    ) -> Annotated[CallToolResult, PageDetailResponse]:
-        """Use after find_pages/search_docs to read compact, paged headings for one page."""
-        with PeopleBooksRepository.connect(resolved_database_url) as repository:
-            doc_version = _require_doc_version(repository, version)
-            page = _resolve_page_or_none(
-                repository,
-                doc_version=doc_version,
-                page_id=page_id,
-                normalized_path=normalized_path,
-            )
-            if page is None:
-                return _structured_result(
-                    _page_not_found_payload(
-                        repository,
-                        doc_version=doc_version,
-                        page_id=page_id,
-                        normalized_path=normalized_path,
-                    )
-                )
-            return _structured_result(
-                _page_detail_payload(
-                    repository,
-                    page,
-                    limit=limit,
-                    offset=offset,
-                    max_level=max_level,
-                )
-            )
 
     @server.tool(
         annotations=read_only,
@@ -557,21 +494,27 @@ def create_server(
         "peoplebooks://versions/{version_code}/books/{book_code}/pages",
         name="peoplebooks_pages",
         title="PeopleBooks Pages",
-        description="List discovered pages for a PeopleBooks book.",
+        description="Read the first 100 discovered pages for a PeopleBooks book.",
         mime_type=JSON_MIME_TYPE,
     )
     def pages_resource(version_code: str, book_code: str) -> str:
         with PeopleBooksRepository.connect(resolved_database_url) as repository:
             version = _require_doc_version(repository, version_code)
             book = _require_book(repository, doc_version_id=version.id, code=book_code)
-            pages = repository.list_pages_for_book(doc_version_id=version.id, book_id=book.id)
-        return _json(
-            {
-                "version": _doc_version_payload(version),
-                "book": _book_payload(book),
-                "pages": [_page_payload(page) for page in pages],
-            }
-        )
+            return _json(_book_pages_payload(repository, version=version, book=book, offset=0))
+
+    @server.resource(
+        "peoplebooks://versions/{version_code}/books/{book_code}/pages/{offset}",
+        name="peoplebooks_pages_page",
+        title="PeopleBooks Pages Page",
+        description="Read up to 100 discovered book pages starting at an offset.",
+        mime_type=JSON_MIME_TYPE,
+    )
+    def pages_page_resource(version_code: str, book_code: str, offset: int) -> str:
+        with PeopleBooksRepository.connect(resolved_database_url) as repository:
+            version = _require_doc_version(repository, version_code)
+            book = _require_book(repository, doc_version_id=version.id, code=book_code)
+            return _json(_book_pages_payload(repository, version=version, book=book, offset=offset))
 
     @server.resource(
         "peoplebooks://pages/{page_id}",
@@ -964,6 +907,39 @@ def _page_payload(page: PageRecord) -> JsonObject:
     }
 
 
+def _book_pages_payload(
+    repository: PeopleBooksRepository,
+    *,
+    version: DocVersionRecord,
+    book: BookRecord,
+    offset: int,
+) -> JsonObject:
+    bounded_offset = max(0, offset)
+    page_window = repository.list_pages_for_book(
+        doc_version_id=version.id,
+        book_id=book.id,
+        limit=BOOK_PAGES_RESOURCE_LIMIT + 1,
+        offset=bounded_offset,
+    )
+    pages = page_window[:BOOK_PAGES_RESOURCE_LIMIT]
+    next_offset = (
+        bounded_offset + BOOK_PAGES_RESOURCE_LIMIT
+        if len(page_window) > BOOK_PAGES_RESOURCE_LIMIT
+        else None
+    )
+    next_uri = None
+    if next_offset is not None:
+        next_uri = f"peoplebooks://versions/{version.code}/books/{book.code}/pages/{next_offset}"
+    return {
+        "version": _doc_version_payload(version),
+        "book": _book_payload(book),
+        "offset": bounded_offset,
+        "returned_count": len(pages),
+        "next_uri": next_uri,
+        "pages": [_page_payload(page) for page in pages],
+    }
+
+
 def _page_search_payload(page: PageSearchRecord) -> JsonObject:
     return {
         "page_id": page.id,
@@ -1001,43 +977,60 @@ def _section_outline_payload(section: SectionRecord) -> JsonObject:
 
 
 def _search_result_payload(result: SearchResultRecord) -> JsonObject:
+    path = list(result.section_path)
+    if path and result.page_title and path[0] == result.page_title:
+        path = path[1:]
     return {
-        "book": {
-            "code": result.book_code,
-            "title": result.book_title,
-        },
-        "page": {
-            "page_id": result.page_id,
-            "title": result.page_title,
-            "source_url": result.source_url,
-        },
-        "section": {
-            "section_id": result.section_id,
-            "stable_id": result.section_stable_id,
-            "heading": result.section_heading,
-            "section_path": result.section_path,
-        },
-        "chunk": {
-            "snippet": result.snippet,
-        },
+        "book_code": result.book_code,
+        "page_id": result.page_id,
+        "title": result.page_title,
+        "section_id": result.section_id,
+        "section_stable_id": result.section_stable_id,
+        "path": path,
+        "snippet": _strip_search_markup(result.snippet),
+        "source_url": result.source_url,
     }
 
 
-def _search_result_payloads(
-    results: Sequence[SearchResultRecord],
+def _search_response_payload(
     *,
+    match: str,
+    results: Sequence[SearchResultRecord],
     max_chars: int,
-) -> tuple[list[JsonObject], bool]:
-    payloads: list[JsonObject] = []
-    snippets, truncated_any = _truncate_texts_to_budget(
-        [_strip_search_markup(result.snippet) for result in results],
-        max_chars=max_chars,
-    )
-    for result, snippet in zip(results, snippets, strict=False):
-        payload = _search_result_payload(result)
-        payload["chunk"]["snippet"] = snippet
-        payloads.append(payload)
-    return payloads, truncated_any
+) -> JsonObject:
+    payloads = [_search_result_payload(result) for result in results]
+    complete = {"match": match, "truncated": False, "results": payloads}
+    if len(_json(complete)) <= max_chars:
+        return complete
+
+    full_snippets = [str(payload["snippet"]) for payload in payloads]
+    while payloads:
+        empty = [dict(payload, snippet="") for payload in payloads]
+        candidate = {"match": match, "truncated": True, "results": empty}
+        if len(_json(candidate)) <= max_chars:
+            break
+        payloads.pop()
+        full_snippets.pop()
+
+    if not payloads:
+        return {"match": match, "truncated": bool(results), "results": []}
+
+    low = 0
+    high = max(len(snippet) for snippet in full_snippets)
+    best = {"match": match, "truncated": True, "results": []}
+    while low <= high:
+        snippet_limit = (low + high) // 2
+        candidate_results = []
+        for payload, snippet in zip(payloads, full_snippets, strict=True):
+            truncated_snippet, _ = _truncate_text(snippet, max_chars=snippet_limit)
+            candidate_results.append(dict(payload, snippet=truncated_snippet))
+        candidate = {"match": match, "truncated": True, "results": candidate_results}
+        if len(_json(candidate)) <= max_chars:
+            best = candidate
+            low = snippet_limit + 1
+        else:
+            high = snippet_limit - 1
+    return best
 
 
 def _strip_search_markup(text: str) -> str:
@@ -1054,30 +1047,18 @@ def _bounded_max_chars(max_chars: int, *, default: int) -> int:
     return max(40, min(max_chars, MAX_RESPONSE_CHARS))
 
 
+def _bounded_search_response_chars(max_chars: int) -> int:
+    if max_chars < 1:
+        return DEFAULT_SEARCH_RESPONSE_CHARS
+    return max(256, min(max_chars, MAX_RESPONSE_CHARS))
+
+
 def _bounded_outline_limit(limit: int) -> int:
     return max(1, min(limit, 100))
 
 
 def _bounded_offset(offset: int) -> int:
     return max(0, offset)
-
-
-def _truncate_texts_to_budget(texts: Sequence[str], *, max_chars: int) -> tuple[list[str], bool]:
-    if not texts:
-        return [], False
-
-    remaining = max(0, max_chars)
-    output: list[str] = []
-    truncated_any = False
-    for index, text in enumerate(texts):
-        slots_left = len(texts) - index
-        limit = remaining // slots_left if slots_left else 0
-        truncated_text, truncated = _truncate_text(text, max_chars=limit)
-        output.append(truncated_text)
-        remaining -= len(truncated_text)
-        truncated_any = truncated_any or truncated
-
-    return output, truncated_any
 
 
 def _truncate_text(text: str, *, max_chars: int) -> tuple[str, bool]:

@@ -58,7 +58,7 @@ documentation through read-only MCP tools/resources.
 ## Phase 6: Read-Only MCP Server
 
 - Implement `peoplebooks serve-mcp`.
-- Add read-only MCP tools: `search_docs`, `get_page`, `get_section`, and `list_books`.
+- Add read-only MCP tools: `search_docs`, `get_page_outline`, `get_section`, and `list_books`.
 - Add MCP resources for versions, books, pages, and sections.
 - Ensure MCP handlers only read PostgreSQL and never scrape live Oracle pages.
 - Tests: MCP tool/resource response tests over known indexed content, including stable IDs and source metadata.

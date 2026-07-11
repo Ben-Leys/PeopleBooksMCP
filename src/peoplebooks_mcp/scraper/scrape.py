@@ -11,7 +11,7 @@ from peoplebooks_mcp.repositories import ChunkInput, PageRecord, PeopleBooksRepo
 from peoplebooks_mcp.scraper.fetcher import FetchError, FetchResult
 from peoplebooks_mcp.scraper.oracle import oracle_source_metadata
 
-DEFAULT_PARSER_VERSION = "v1"
+DEFAULT_PARSER_VERSION = "v2"
 
 
 class Fetcher(Protocol):

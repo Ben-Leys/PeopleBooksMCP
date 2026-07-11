@@ -215,6 +215,8 @@ def test_repository_replaces_parsed_sections_and_chunks(postgres_url: str) -> No
                 )
             ],
         )
+        original_section = repository.list_sections_for_page(page_id=page.id)[0]
+        original_chunk = repository.list_chunks_for_page(page_id=page.id)[0]
         repository.replace_page_sections(
             page_id=page.id,
             parser_version="parser-v2",
@@ -249,9 +251,32 @@ def test_repository_replaces_parsed_sections_and_chunks(postgres_url: str) -> No
         chunks = repository.list_chunks_for_page(page_id=page.id)
 
         assert len(sections) == 1
+        assert sections[0].id == original_section.id
         assert sections[0].parser_version == "parser-v2"
         assert sections[0].content == "CreateArray returns an array object."
         assert [chunk.stable_id for chunk in chunks] == ["createarray-0", "createarray-1"]
+        assert chunks[0].id == original_chunk.id
+
+        repository.replace_page_sections(
+            page_id=page.id,
+            parser_version="parser-v3",
+            sections=[
+                SectionInput(
+                    stable_id="replacement",
+                    heading="Replacement",
+                    level=1,
+                    section_path=("Replacement",),
+                    ordinal=0,
+                    content="Replacement content.",
+                    chunks=[],
+                    source_metadata={},
+                )
+            ],
+        )
+
+        replacement_sections = repository.list_sections_for_page(page_id=page.id)
+        assert [section.stable_id for section in replacement_sections] == ["replacement"]
+        assert repository.list_chunks_for_page(page_id=page.id) == []
 
 
 def test_schema_rejects_chunk_with_mismatched_page_and_section(postgres_url: str) -> None:

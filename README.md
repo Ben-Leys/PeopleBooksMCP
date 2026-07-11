@@ -75,7 +75,8 @@ Show progress:
 uv run peoplebooks status --version pt862
 ```
 
-Rebuild parsed sections and chunks from stored raw HTML without refetching Oracle:
+Rebuild Markdown sections and semantic chunks from stored raw HTML without
+refetching Oracle. Stable sections and chunks retain their database IDs:
 
 ```powershell
 uv run peoplebooks reparse --version pt862 --parser-version v2
@@ -126,8 +127,8 @@ Use the smallest useful result first:
    `page_id`/`section_id` handles.
 4. `find_pages` locates likely pages without returning content.
 5. `get_page_outline` returns paged headings for one page.
-6. `get_section` returns compact section snippets by default; request
-   `detail="full"` only when exact content is needed.
+6. `get_section` returns one Markdown `content` page. If `next_cursor` is present,
+   pass it back with the same section handle to retrieve the lossless continuation.
 
 Tool calls return data in `structuredContent`; the legacy text content block is
 left empty to avoid duplicating the JSON payload.

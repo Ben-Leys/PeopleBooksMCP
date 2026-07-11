@@ -1054,9 +1054,9 @@ class PeopleBooksRepository:
         sections: Sequence[SectionInput],
     ) -> None:
         with self._connection.transaction():
-            self._connection.execute("DELETE FROM sections WHERE page_id = %s", (page_id,))
-
+            retained_section_ids: list[str] = []
             for section in sections:
+                retained_section_ids.append(section.stable_id)
                 section_row = self._connection.execute(
                     """
                     INSERT INTO sections (
@@ -1071,6 +1071,15 @@ class PeopleBooksRepository:
                         source_metadata
                     )
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (page_id, stable_id) DO UPDATE
+                    SET heading = EXCLUDED.heading,
+                        level = EXCLUDED.level,
+                        section_path = EXCLUDED.section_path,
+                        ordinal = EXCLUDED.ordinal,
+                        content = EXCLUDED.content,
+                        parser_version = EXCLUDED.parser_version,
+                        source_metadata = EXCLUDED.source_metadata,
+                        updated_at = now()
                     RETURNING *
                     """,
                     (
@@ -1087,7 +1096,9 @@ class PeopleBooksRepository:
                 ).fetchone()
                 section_record = _record(SectionRecord, section_row)
 
+                retained_chunk_ids: list[str] = []
                 for chunk in section.chunks:
+                    retained_chunk_ids.append(chunk.stable_id)
                     self._connection.execute(
                         """
                         INSERT INTO chunks (
@@ -1099,6 +1110,13 @@ class PeopleBooksRepository:
                             metadata
                         )
                         VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (section_id, stable_id) DO UPDATE
+                        SET page_id = EXCLUDED.page_id,
+                            ordinal = EXCLUDED.ordinal,
+                            content = EXCLUDED.content,
+                            metadata = EXCLUDED.metadata,
+                            search_vector = NULL,
+                            updated_at = now()
                         """,
                         (
                             page_id,
@@ -1109,6 +1127,33 @@ class PeopleBooksRepository:
                             Jsonb(chunk.metadata),
                         ),
                     )
+
+                if retained_chunk_ids:
+                    self._connection.execute(
+                        """
+                        DELETE FROM chunks
+                        WHERE section_id = %s
+                          AND NOT (stable_id = ANY(%s))
+                        """,
+                        (section_record.id, retained_chunk_ids),
+                    )
+                else:
+                    self._connection.execute(
+                        "DELETE FROM chunks WHERE section_id = %s",
+                        (section_record.id,),
+                    )
+
+            if retained_section_ids:
+                self._connection.execute(
+                    """
+                    DELETE FROM sections
+                    WHERE page_id = %s
+                      AND NOT (stable_id = ANY(%s))
+                    """,
+                    (page_id, retained_section_ids),
+                )
+            else:
+                self._connection.execute("DELETE FROM sections WHERE page_id = %s", (page_id,))
 
             self._connection.execute(
                 """

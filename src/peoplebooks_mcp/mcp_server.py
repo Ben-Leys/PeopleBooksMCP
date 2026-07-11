@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
 import json
 from collections.abc import Sequence
 from typing import Annotated, Any, Literal
@@ -13,7 +16,6 @@ from peoplebooks_mcp.config import load_config
 from peoplebooks_mcp.repositories import (
     EXPECTED_SCHEMA_REVISION,
     BookRecord,
-    ChunkRecord,
     DocVersionRecord,
     PageRecord,
     PageSearchRecord,
@@ -99,15 +101,6 @@ class SectionPayload(SectionOutlinePayload):
     page_id: int
     section_path: list[str]
     ordinal: int
-    content: str | None = Field(default=None, exclude_if=lambda value: value is None)
-
-
-class ChunkPayload(StrictModel):
-    id: int
-    stable_id: str
-    ordinal: int
-    snippet: str | None = Field(default=None, exclude_if=lambda value: value is None)
-    content: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class BudgetPayload(StrictModel):
@@ -171,7 +164,8 @@ class SectionDetailResponse(StrictModel):
     book: BookPayload | None = Field(default=None, exclude_if=lambda value: value is None)
     page: PagePayload | None = Field(default=None, exclude_if=lambda value: value is None)
     section: SectionPayload | None = Field(default=None, exclude_if=lambda value: value is None)
-    chunks: list[ChunkPayload] | None = Field(default=None, exclude_if=lambda value: value is None)
+    content: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    next_cursor: str | None = None
     budget: BudgetPayload | None = Field(default=None, exclude_if=lambda value: value is None)
     error: ErrorDetailPayload | None = Field(default=None, exclude_if=lambda value: value is None)
 
@@ -401,8 +395,9 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
         normalized_path: str | None = None,
         detail: DetailLevel = "compact",
         max_chars: int = DEFAULT_SECTION_CHARS,
+        cursor: str | None = None,
     ) -> Annotated[CallToolResult, SectionDetailResponse]:
-        """Use after search_docs or get_page_outline. Compact by default; full content is opt-in."""
+        """Use after search_docs or get_page_outline. Returns paged Markdown without duplication."""
         with PeopleBooksRepository.connect(resolved_database_url) as repository:
             doc_version = _require_doc_version(repository, version)
             try:
@@ -418,14 +413,18 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
                 return _structured_result(
                     _error_payload(code="section_not_found", message=str(error))
                 )
-            return _structured_result(
-                _section_detail_payload(
-                    repository,
-                    section,
-                    detail=detail,
-                    max_chars=max_chars,
+            try:
+                return _structured_result(
+                    _section_detail_payload(
+                        repository,
+                        section,
+                        detail=detail,
+                        max_chars=max_chars,
+                        cursor=cursor,
+                    )
                 )
-            )
+            except ValueError as error:
+                return _structured_result(_error_payload(code="invalid_cursor", message=str(error)))
 
     @server.tool(
         annotations=read_only,
@@ -597,6 +596,7 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
                     section,
                     detail="compact",
                     max_chars=DEFAULT_SECTION_CHARS,
+                    cursor=None,
                 )
             )
 
@@ -830,41 +830,101 @@ def _section_detail_payload(
     *,
     detail: DetailLevel,
     max_chars: int,
+    cursor: str | None,
 ) -> JsonObject:
     page = _require_page_by_id(repository, section.page_id)
     version = _require_doc_version_by_id(repository, page.doc_version_id)
     book = _require_book_by_id(repository, page.book_id)
-    chunks = repository.list_chunks_for_section(section_id=section.id)
     bounded_max_chars = _bounded_max_chars(max_chars, default=DEFAULT_SECTION_CHARS)
-    section_texts = [section.content] if detail == "full" else []
-    chunk_texts = [chunk.content for chunk in chunks]
-    budgeted_texts, text_truncated = _truncate_texts_to_budget(
-        [*section_texts, *chunk_texts],
+    del detail  # Retained as a compatibility input; all levels now use lossless paging.
+    offset = _decode_section_cursor(cursor, section=section) if cursor else 0
+    content, next_offset = _section_content_page(
+        section.content,
+        offset=offset,
         max_chars=bounded_max_chars,
     )
-    section_content = budgeted_texts[0] if section_texts else None
-    chunk_start = 1 if section_texts else 0
-    chunk_contents = budgeted_texts[chunk_start:]
-    chunk_payloads, chunk_truncated = _chunk_payloads(
-        chunks,
-        detail=detail,
-        contents=chunk_contents,
+    next_cursor = (
+        _encode_section_cursor(section=section, offset=next_offset)
+        if next_offset is not None
+        else None
     )
-    section_payload = _section_payload(
-        section,
-        content=section_content,
-    )
+    section_payload = _section_payload(section)
 
     return {
         "version": _doc_version_payload(version),
         "book": _book_payload(book),
         "page": _page_payload(page),
         "section": section_payload,
-        "chunks": chunk_payloads,
+        "content": content,
+        "next_cursor": next_cursor,
         "budget": {
-            "truncated": text_truncated or chunk_truncated,
+            "truncated": next_cursor is not None,
         },
     }
+
+
+def _section_content_page(
+    content: str,
+    *,
+    offset: int,
+    max_chars: int,
+) -> tuple[str, int | None]:
+    if offset < 0 or offset > len(content):
+        raise ValueError("The continuation cursor points outside this section.")
+    if offset == len(content):
+        return "", None
+
+    hard_end = min(len(content), offset + max_chars)
+    if hard_end == len(content):
+        return content[offset:], None
+
+    end = hard_end
+    block_boundary = content.rfind("\n\n", offset + 40, hard_end)
+    if block_boundary >= 0:
+        end = block_boundary + 2
+    else:
+        line_boundary = content.rfind("\n", offset + 40, hard_end)
+        if line_boundary >= 0:
+            end = line_boundary + 1
+    return content[offset:end], end
+
+
+def _encode_section_cursor(*, section: SectionRecord, offset: int) -> str:
+    payload = json.dumps(
+        {
+            "v": 1,
+            "section_id": section.id,
+            "section": section.stable_id,
+            "content": hashlib.sha256(section.content.encode()).hexdigest()[:16],
+            "offset": offset,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return base64.urlsafe_b64encode(payload).rstrip(b"=").decode()
+
+
+def _decode_section_cursor(cursor: str, *, section: SectionRecord) -> int:
+    try:
+        padding = "=" * (-len(cursor) % 4)
+        payload = json.loads(base64.b64decode(cursor + padding, altchars=b"-_", validate=True))
+    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError, TypeError) as error:
+        raise ValueError("The continuation cursor is invalid; restart without a cursor.") from error
+    if not isinstance(payload, dict) or payload.get("v") != 1:
+        raise ValueError(
+            "The continuation cursor version is unsupported; restart without a cursor."
+        )
+    if payload.get("section_id") != section.id or payload.get("section") != section.stable_id:
+        raise ValueError("The continuation cursor belongs to a different section.")
+    content_digest = hashlib.sha256(section.content.encode()).hexdigest()[:16]
+    if payload.get("content") != content_digest:
+        raise ValueError(
+            "The section changed after this cursor was issued; restart without a cursor."
+        )
+    offset = payload.get("offset")
+    if not isinstance(offset, int) or isinstance(offset, bool):
+        raise ValueError("The continuation cursor has an invalid offset.")
+    return offset
 
 
 def _doc_version_payload(version: DocVersionRecord) -> JsonObject:
@@ -906,12 +966,8 @@ def _page_search_payload(page: PageSearchRecord) -> JsonObject:
     }
 
 
-def _section_payload(
-    section: SectionRecord,
-    *,
-    content: str | None,
-) -> JsonObject:
-    payload = {
+def _section_payload(section: SectionRecord) -> JsonObject:
+    return {
         "id": section.id,
         "page_id": section.page_id,
         "stable_id": section.stable_id,
@@ -920,9 +976,6 @@ def _section_payload(
         "section_path": section.section_path,
         "ordinal": section.ordinal,
     }
-    if content is not None:
-        payload["content"] = content
-    return payload
 
 
 def _section_outline_payload(section: SectionRecord) -> JsonObject:
@@ -932,28 +985,6 @@ def _section_outline_payload(section: SectionRecord) -> JsonObject:
         "heading": section.heading,
         "level": section.level,
     }
-
-
-def _chunk_payloads(
-    chunks: Sequence[ChunkRecord],
-    *,
-    detail: DetailLevel,
-    contents: Sequence[str],
-) -> tuple[list[JsonObject], bool]:
-    payloads: list[JsonObject] = []
-    truncated_any = len(contents) < len(chunks)
-    for chunk, text in zip(chunks, contents, strict=False):
-        payload: JsonObject = {
-            "id": chunk.id,
-            "stable_id": chunk.stable_id,
-            "ordinal": chunk.ordinal,
-        }
-        if detail == "full":
-            payload["content"] = text
-        else:
-            payload["snippet"] = text
-        payloads.append(payload)
-    return payloads, truncated_any
 
 
 def _search_result_payload(result: SearchResultRecord) -> JsonObject:
@@ -1060,8 +1091,7 @@ def _page_not_found_payload(
         return _error_payload(
             code="invalid_request",
             message=(
-                "Provide either page_id returned by search/find_pages or an exact "
-                "normalized_path."
+                "Provide either page_id returned by search/find_pages or an exact normalized_path."
             ),
         )
 

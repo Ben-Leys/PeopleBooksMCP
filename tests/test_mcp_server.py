@@ -47,7 +47,9 @@ def test_mcp_tools_return_indexed_docs_with_stable_ids(postgres_url: str) -> Non
 
     assert section["section"]["id"] == ids["section_id"]
     assert section["section"]["stable_id"] == "createarray"
-    assert section["chunks"][0]["stable_id"] == "createarray-0"
+    assert section["content"] == "CreateArray returns an array object for PeopleCode programs."
+    assert section["next_cursor"] is None
+    assert "chunks" not in section
     assert "source_metadata" not in section["section"]
 
 
@@ -142,10 +144,11 @@ def test_mcp_tool_can_get_section_by_page_path_and_stable_id(postgres_url: str) 
 
     assert result["section"]["heading"] == "CreateArray"
     assert result["page"]["title"] == "CreateArray"
-    assert result["chunks"][0]["stable_id"] == "createarray-0"
+    assert result["content"].startswith("CreateArray returns")
+    assert "chunks" not in result
 
 
-def test_mcp_get_section_defaults_to_compact_budget_and_full_detail_is_opt_in(
+def test_mcp_get_section_returns_lossless_pages_with_an_opaque_cursor(
     postgres_url: str,
 ) -> None:
     run_migrations(postgres_url)
@@ -155,7 +158,7 @@ def test_mcp_get_section_defaults_to_compact_budget_and_full_detail_is_opt_in(
     compact = _call_tool(
         server,
         "get_section",
-        {"version": "pt862", "section_id": ids["section_id"], "max_chars": 90},
+        {"version": "pt862", "section_id": ids["section_id"], "max_chars": 120},
     )
     full = _call_tool(
         server,
@@ -168,15 +171,48 @@ def test_mcp_get_section_defaults_to_compact_budget_and_full_detail_is_opt_in(
         },
     )
 
+    continuation = _call_tool(
+        server,
+        "get_section",
+        {
+            "version": "pt862",
+            "section_id": ids["section_id"],
+            "max_chars": 120,
+            "cursor": compact["next_cursor"],
+        },
+    )
+
     assert "content" not in compact["section"]
-    assert "content" not in compact["chunks"][0]
-    assert compact["chunks"][0]["snippet"].endswith("...")
-    assert len(compact["chunks"][0]["snippet"]) <= 93
+    assert len(compact["content"]) <= 120
+    assert not compact["content"].endswith("...")
+    assert compact["next_cursor"]
     assert compact["budget"]["truncated"] is True
 
-    assert full["section"]["content"].startswith("Application classes can expose")
-    assert full["chunks"][0]["content"].startswith("Application classes can expose")
+    assert compact["content"] + continuation["content"] == full["content"]
+    assert full["content"].startswith("Application classes can expose")
+    assert "chunks" not in full
+    assert full["next_cursor"] is None
     assert full["budget"]["truncated"] is False
+
+
+def test_mcp_get_section_rejects_a_cursor_for_another_section(postgres_url: str) -> None:
+    run_migrations(postgres_url)
+    first = _seed_long_section_docs(postgres_url)
+    second = _seed_indexed_docs(postgres_url)
+    server = create_server(database_url=postgres_url)
+
+    first_page = _call_tool(
+        server,
+        "get_section",
+        {"section_id": first["section_id"], "max_chars": 60},
+    )
+    result = _call_tool(
+        server,
+        "get_section",
+        {"section_id": second["section_id"], "cursor": first_page["next_cursor"]},
+    )
+
+    assert result["error"]["code"] == "invalid_cursor"
 
 
 def test_mcp_tools_and_resources_never_expose_raw_html(postgres_url: str) -> None:
@@ -437,7 +473,7 @@ def test_mcp_search_docs_budget_applies_across_all_returned_snippets(
     assert result["budget"]["truncated"] is True
 
 
-def test_mcp_get_section_budget_applies_across_all_returned_chunks(postgres_url: str) -> None:
+def test_mcp_get_section_does_not_expose_internal_search_chunks(postgres_url: str) -> None:
     run_migrations(postgres_url)
     ids = _seed_multi_chunk_section_docs(postgres_url)
     server = create_server(database_url=postgres_url)
@@ -448,10 +484,9 @@ def test_mcp_get_section_budget_applies_across_all_returned_chunks(postgres_url:
         {"version": "pt862", "section_id": ids["section_id"], "max_chars": 120},
     )
 
-    snippets = [chunk["snippet"] for chunk in result["chunks"]]
-    assert len(snippets) == 3
-    assert sum(len(snippet) for snippet in snippets) <= 120
-    assert result["budget"]["truncated"] is True
+    assert result["content"] == "Combined section content is intentionally long."
+    assert "chunks" not in result
+    assert result["budget"]["truncated"] is False
 
 
 def test_mcp_search_docs_exact_mode_prefers_title_and_heading_matches(
@@ -496,9 +531,7 @@ def test_mcp_search_docs_exact_mode_treats_peoplecode_wildcards_literally(
         },
     )
 
-    assert {item["page"]["page_id"] for item in result["results"]} == {
-        ids["percent_this_page_id"]
-    }
+    assert {item["page"]["page_id"] for item in result["results"]} == {ids["percent_this_page_id"]}
 
 
 def test_mcp_search_docs_exact_mode_returns_diverse_page_candidates(
@@ -577,6 +610,9 @@ def test_mcp_tool_metadata_has_specific_output_schemas_and_workflow_descriptions
     assert search_schema["properties"]["results"]["type"] == "array"
     budget_schema = _schema_property(section_schema, "budget")
     assert set(budget_schema["properties"]) == {"truncated"}
+    assert "content" in section_schema["properties"]
+    assert "next_cursor" in section_schema["properties"]
+    assert "chunks" not in section_schema["properties"]
     assert search_schema.get("additionalProperties") is not True
     assert tools["get_page"].outputSchema.get("additionalProperties") is not True
     assert tools["get_page_outline"].outputSchema.get("additionalProperties") is not True

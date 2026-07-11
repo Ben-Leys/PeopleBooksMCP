@@ -189,7 +189,7 @@ def status(
 @app.command()
 def reparse(
     version: Annotated[str, typer.Option(help="Documentation version key.")] = "pt862",
-    parser_version: Annotated[str, typer.Option(help="Parser version to write.")] = "v1",
+    parser_version: Annotated[str, typer.Option(help="Parser version to write.")] = "v2",
 ) -> None:
     """Rebuild parsed sections and chunks from stored raw HTML."""
     if not version or not parser_version:

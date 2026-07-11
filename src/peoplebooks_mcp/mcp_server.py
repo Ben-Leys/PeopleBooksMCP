@@ -179,8 +179,18 @@ def _structured_result(payload: JsonObject) -> CallToolResult:
     return CallToolResult(content=[], structuredContent=payload)
 
 
-def create_server(*, database_url: str | None = None) -> FastMCP:
-    resolved_database_url = database_url or load_config().settings.database_url
+def create_server(
+    *,
+    database_url: str | None = None,
+    search_timeout_seconds: float | None = None,
+) -> FastMCP:
+    settings = load_config().settings
+    resolved_database_url = database_url or settings.database_url
+    resolved_search_timeout = (
+        settings.search_timeout_seconds
+        if search_timeout_seconds is None
+        else search_timeout_seconds
+    )
     server = FastMCP(
         "peoplebooks-mcp",
         instructions=(
@@ -209,7 +219,10 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
         max_chars: int = DEFAULT_SNIPPET_CHARS,
     ) -> Annotated[CallToolResult, SearchDocsResponse]:
         """Use first for questions or code checks. Returns compact snippets and stable handles."""
-        with PeopleBooksRepository.connect(resolved_database_url) as repository:
+        with PeopleBooksRepository.connect(
+            resolved_database_url,
+            statement_timeout_seconds=resolved_search_timeout,
+        ) as repository:
             doc_version = _require_doc_version(repository, version)
             bounded_limit = _bounded_limit(limit)
             bounded_max_chars = _bounded_max_chars(max_chars, default=DEFAULT_SNIPPET_CHARS)
@@ -232,6 +245,15 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
                         page_id=page_id,
                     )
                     match_mode = "strict"
+                if search_mode == "auto" and not results:
+                    results = repository.search_chunks_relaxed(
+                        doc_version_id=doc_version.id,
+                        query=query,
+                        limit=bounded_limit,
+                        book_code=book_code,
+                        page_id=page_id,
+                    )
+                    match_mode = "relaxed" if results else "none"
             except UndefinedColumn:
                 return _structured_result(
                     {
@@ -244,22 +266,13 @@ def create_server(*, database_url: str | None = None) -> FastMCP:
                         "error": {
                             "code": "schema_not_ready",
                             "message": (
-                                "Full-text search is unavailable because chunks.search_vector is "
+                                "Search is unavailable because required chunk search columns are "
                                 "missing. Run Alembic migrations and re-index the corpus."
                             ),
                             "details": {"expected_revision": EXPECTED_SCHEMA_REVISION},
                         },
                     }
                 )
-            if search_mode == "auto" and not results:
-                results = repository.search_chunks_relaxed(
-                    doc_version_id=doc_version.id,
-                    query=query,
-                    limit=bounded_limit,
-                    book_code=book_code,
-                    page_id=page_id,
-                )
-                match_mode = "relaxed" if results else "none"
         payloads, truncated = _search_result_payloads(
             results,
             max_chars=bounded_max_chars,

@@ -248,7 +248,7 @@ def test_mcp_health_reports_ready_schema_and_index_counts(postgres_url: str) -> 
     result = _call_tool(server, "health", {"version": "pt862"})
 
     assert result["status"] == "ready"
-    assert result["schema"]["current_revision"] == "0002_phase_5_full_text_indexing"
+    assert result["schema"]["current_revision"] == "0003_hybrid_search"
     assert result["schema"]["is_current"] is True
     assert result["schema"]["missing_required_columns"] == []
     assert result["content"]["parsed_pages"] == 4
@@ -556,6 +556,30 @@ def test_mcp_search_docs_exact_mode_returns_diverse_page_candidates(
         ids["do_stuff_page_id"],
         ids["do_stuff_example_page_id"],
     ]
+
+
+def test_mcp_search_docs_relaxed_mode_uses_trigrams_and_diversifies_pages(
+    postgres_url: str,
+) -> None:
+    run_migrations(postgres_url)
+    ids = _seed_exact_diversity_docs(postgres_url)
+    server = create_server(database_url=postgres_url)
+
+    result = _call_tool(
+        server,
+        "search_docs",
+        {
+            "version": "pt862",
+            "query": "DoStuf",
+            "limit": 2,
+        },
+    )
+
+    assert result["match_mode"] == "relaxed"
+    assert {item["page"]["page_id"] for item in result["results"]} == {
+        ids["do_stuff_page_id"],
+        ids["do_stuff_example_page_id"],
+    }
 
 
 def test_mcp_search_docs_relaxed_snippet_is_near_matched_terms(postgres_url: str) -> None:

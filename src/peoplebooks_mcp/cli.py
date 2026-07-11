@@ -231,4 +231,7 @@ def index(
 def serve_mcp() -> None:
     """Start the read-only MCP server."""
     config = load_config()
-    create_server(database_url=config.settings.database_url).run()
+    create_server(
+        database_url=config.settings.database_url,
+        search_timeout_seconds=config.settings.search_timeout_seconds,
+    ).run()

@@ -339,8 +339,8 @@ def test_serve_mcp_command_runs_stdio_server(monkeypatch) -> None:
         def run(self) -> None:
             calls.append("run")
 
-    def fake_create_server(*, database_url: str) -> FakeServer:
-        calls.append(database_url)
+    def fake_create_server(*, database_url: str, search_timeout_seconds: float) -> FakeServer:
+        calls.append((database_url, search_timeout_seconds))
         return FakeServer()
 
     monkeypatch.setattr("peoplebooks_mcp.cli.load_config", _test_config)
@@ -349,7 +349,7 @@ def test_serve_mcp_command_runs_stdio_server(monkeypatch) -> None:
     result = CliRunner().invoke(app, ["serve-mcp"])
 
     assert result.exit_code == 0
-    assert calls == ["postgresql://example/peoplebooks", "run"]
+    assert calls == [("postgresql://example/peoplebooks", 10.0), "run"]
 
 
 def _test_config() -> AppConfig:

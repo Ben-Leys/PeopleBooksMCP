@@ -9,6 +9,7 @@ from typing import Any
 DEFAULT_DATABASE_URL = "postgresql://peoplebooks:peoplebooks@localhost:5432/peoplebooks"
 DEFAULT_USER_AGENT = "PeopleBooksMCP/0.1.0"
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 20.0
+DEFAULT_SEARCH_TIMEOUT_SECONDS = 10.0
 DEFAULT_CONFIG_ENV = "PEOPLEBOOKS_CONFIG"
 
 
@@ -17,6 +18,7 @@ class RuntimeSettings:
     database_url: str = DEFAULT_DATABASE_URL
     user_agent: str = DEFAULT_USER_AGENT
     request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
+    search_timeout_seconds: float = DEFAULT_SEARCH_TIMEOUT_SECONDS
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,12 +112,19 @@ def _apply_environment_settings(settings: RuntimeSettings) -> RuntimeSettings:
         env_settings["user_agent"] = user_agent
     if timeout := os.environ.get("PEOPLEBOOKS_REQUEST_TIMEOUT_SECONDS"):
         env_settings["request_timeout_seconds"] = timeout
+    if timeout := os.environ.get("PEOPLEBOOKS_SEARCH_TIMEOUT_SECONDS"):
+        env_settings["search_timeout_seconds"] = timeout
 
     return _merge_settings(settings, env_settings)
 
 
 def _merge_settings(settings: RuntimeSettings, overrides: dict[str, Any]) -> RuntimeSettings:
-    accepted_keys = {"database_url", "user_agent", "request_timeout_seconds"}
+    accepted_keys = {
+        "database_url",
+        "user_agent",
+        "request_timeout_seconds",
+        "search_timeout_seconds",
+    }
     unknown_keys = sorted(set(overrides) - accepted_keys)
     if unknown_keys:
         unknown = ", ".join(unknown_keys)
@@ -124,5 +133,9 @@ def _merge_settings(settings: RuntimeSettings, overrides: dict[str, Any]) -> Run
     values = dict(overrides)
     if "request_timeout_seconds" in values:
         values["request_timeout_seconds"] = float(values["request_timeout_seconds"])
+    if "search_timeout_seconds" in values:
+        values["search_timeout_seconds"] = float(values["search_timeout_seconds"])
+        if values["search_timeout_seconds"] <= 0:
+            raise ValueError("search_timeout_seconds must be greater than zero")
 
     return replace(settings, **values)

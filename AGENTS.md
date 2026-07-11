@@ -43,7 +43,7 @@
 - Store raw HTML, normalized URL, source metadata, content hash, parser version, fetch status, timestamps, and append-only fetch diagnostics.
 - Parse leaf pages into H1/H2/H3 Markdown sections and roughly 1,200-2,000-character semantic chunks.
 - Preserve code blocks, lists, tables, warnings, and links; heading-only sections receive searchable chunks.
-- Store chunk full-text vectors in `chunks.search_vector` with a GIN index.
+- Store English and simple chunk vectors with GIN indexes; trigram-index compact identifier metadata.
 - `peoplebooks_mcp.indexing.index_pages` refreshes chunk vectors and marks pages indexed.
 - Repository entry point: `peoplebooks_mcp.repositories.PeopleBooksRepository`.
 - Repository search returns version, book, page, section path, source URL, snippets, rank, and stable section/chunk IDs.
@@ -71,7 +71,8 @@
 - Useful search results include book, `page_id`, page title, `section_id`, section path, source URL, and snippet.
 - Prefer `search_docs` or `find_pages`, then returned `page_id`/`section_id`, instead of guessing page paths.
 - Use `search_docs(search_mode="exact")` for specific API, page, or heading lookups.
-- `search_docs` uses strict PostgreSQL full-text search first, then a bounded relaxed fallback when strict search returns no hits.
+- `search_docs` uses strict English FTS first, then bounded OR-style English/simple FTS plus trigram reranking and page diversification.
+- `search_docs` database work has a configurable 10-second default statement timeout.
 - Use `get_page_outline` for paged headings before requesting body text with `get_section`.
 - `search_docs` and `get_section` support `max_chars`.
 - `get_section` returns one Markdown `content` field and an opaque `next_cursor` for lossless continuation.

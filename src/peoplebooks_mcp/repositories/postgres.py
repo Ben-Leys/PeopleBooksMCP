@@ -16,8 +16,12 @@ from psycopg.types.json import Jsonb
 from peoplebooks_mcp.database import connect
 
 JsonObject = dict[str, Any]
-EXPECTED_SCHEMA_REVISION = "0002_phase_5_full_text_indexing"
-REQUIRED_SCHEMA_COLUMNS = (("chunks", "search_vector"),)
+EXPECTED_SCHEMA_REVISION = "0003_hybrid_search"
+REQUIRED_SCHEMA_COLUMNS = (
+    ("chunks", "search_vector"),
+    ("chunks", "simple_search_vector"),
+    ("chunks", "identifier_text"),
+)
 QUERY_TERM_RE = re.compile(r"[a-z0-9][a-z0-9_'-]*", re.IGNORECASE)
 QUERY_STOP_WORDS = frozenset(
     {
@@ -271,15 +275,31 @@ class SectionInput:
 
 
 class PeopleBooksRepository:
-    def __init__(self, connection: psycopg.Connection) -> None:
+    def __init__(
+        self,
+        connection: psycopg.Connection,
+        *,
+        statement_timeout_seconds: float | None = None,
+    ) -> None:
         self._connection = connection
         self._connection.row_factory = dict_row
+        if statement_timeout_seconds is not None:
+            timeout_ms = max(1, round(statement_timeout_seconds * 1000))
+            self._connection.execute(
+                "SELECT set_config('statement_timeout', %s, false)",
+                (f"{timeout_ms}ms",),
+            )
 
     @classmethod
     @contextmanager
-    def connect(cls, database_url: str) -> Iterator[Self]:
+    def connect(
+        cls,
+        database_url: str,
+        *,
+        statement_timeout_seconds: float | None = None,
+    ) -> Iterator[Self]:
         with connect(database_url) as connection:
-            yield cls(connection)
+            yield cls(connection, statement_timeout_seconds=statement_timeout_seconds)
 
     @property
     def connection(self) -> psycopg.Connection:
@@ -1240,6 +1260,23 @@ class PeopleBooksRepository:
                     )
                     || setweight(to_tsvector('english', coalesce(s.heading, '')), 'A')
                     || setweight(to_tsvector('english', coalesce(c.content, '')), 'B'),
+                simple_search_vector =
+                    setweight(to_tsvector('simple', coalesce(p.title, '')), 'A')
+                    || setweight(
+                        to_tsvector('simple', coalesce(array_to_string(s.section_path, ' '), '')),
+                        'A'
+                    )
+                    || setweight(to_tsvector('simple', coalesce(s.heading, '')), 'A')
+                    || setweight(to_tsvector('simple', coalesce(c.content, '')), 'B'),
+                identifier_text = lower(
+                    concat_ws(
+                        ' ',
+                        p.title,
+                        p.normalized_path,
+                        array_to_string(s.section_path, ' '),
+                        s.heading
+                    )
+                ),
                 updated_at = now()
             FROM pages AS p, sections AS s
             WHERE c.page_id = p.id
@@ -1467,12 +1504,26 @@ class PeopleBooksRepository:
         if not terms or limit < 1:
             return []
 
+        identifier_queries = [term for term in terms if len(term) >= 3]
+        candidate_limit = max(100, min(500, limit * 25))
         rows = self._connection.execute(
             """
-            WITH query_terms AS (
-                SELECT unnest(%s::text[]) AS term
+            WITH search_queries AS (
+                SELECT
+                    (
+                        SELECT string_agg(lexeme, ' | ')::tsquery
+                        FROM unnest(
+                            tsvector_to_array(to_tsvector('english', %s))
+                        ) AS lexeme
+                    ) AS english_query,
+                    (
+                        SELECT string_agg(lexeme, ' | ')::tsquery
+                        FROM unnest(
+                            tsvector_to_array(to_tsvector('simple', %s))
+                        ) AS lexeme
+                    ) AS simple_query
             ),
-            scored AS (
+            candidates AS MATERIALIZED (
                 SELECT
                     dv.code AS version_code,
                     dv.label AS version_label,
@@ -1490,62 +1541,71 @@ class PeopleBooksRepository:
                     c.id AS chunk_id,
                     c.stable_id AS chunk_stable_id,
                     regexp_replace(c.content, '\\s+', ' ', 'g') AS clean_content,
-                    max(NULLIF(strpos(lower(c.content), qt.term), 0)) FILTER (
-                        WHERE lower(coalesce(c.content, '')) LIKE ('%%' || qt.term || '%%')
-                    ) AS snippet_match_position,
-                    count(DISTINCT qt.term) FILTER (
-                        WHERE lower(
-                            coalesce(b.title, '') || ' ' ||
-                            coalesce(p.title, '') || ' ' ||
-                            coalesce(array_to_string(s.section_path, ' '), '') || ' ' ||
-                            coalesce(s.heading, '') || ' ' ||
-                            coalesce(c.content, '')
-                        ) LIKE ('%%' || qt.term || '%%')
-                    )::int AS matched_terms,
-                    (
-                        count(DISTINCT qt.term) FILTER (
-                            WHERE lower(coalesce(b.title, '')) LIKE ('%%' || qt.term || '%%')
-                        ) * 1.0
-                        + count(DISTINCT qt.term) FILTER (
-                            WHERE lower(coalesce(p.title, '')) LIKE ('%%' || qt.term || '%%')
-                        ) * 2.0
-                        + count(DISTINCT qt.term) FILTER (
-                            WHERE lower(
-                                coalesce(array_to_string(s.section_path, ' '), '') || ' ' ||
-                                coalesce(s.heading, '')
-                            ) LIKE ('%%' || qt.term || '%%')
-                        ) * 2.0
-                        + count(DISTINCT qt.term) FILTER (
-                            WHERE lower(coalesce(c.content, '')) LIKE ('%%' || qt.term || '%%')
-                        ) * 10.0
-                    )::float8 AS rank
+                    c.simple_search_vector,
+                    c.identifier_text,
+                    coalesce(ts_rank_cd(c.search_vector, sq.english_query), 0)::float8
+                        AS english_rank,
+                    coalesce(ts_rank_cd(c.simple_search_vector, sq.simple_query), 0)::float8
+                        AS simple_rank,
+                    coalesce((
+                        SELECT max(word_similarity(identifier_query, c.identifier_text))
+                        FROM unnest(%s::text[]) AS identifier_query
+                    ), 0)::float8 AS identifier_rank
                 FROM chunks AS c
                 JOIN pages AS p ON p.id = c.page_id
                 JOIN books AS b ON b.id = p.book_id
                 JOIN doc_versions AS dv ON dv.id = p.doc_version_id
                 JOIN sections AS s ON s.id = c.section_id
-                CROSS JOIN query_terms AS qt
+                CROSS JOIN search_queries AS sq
                 WHERE p.doc_version_id = %s
                   AND p.fetch_status IN ('parsed', 'indexed')
                   AND (%s::text IS NULL OR b.code = %s)
                   AND (%s::bigint IS NULL OR p.id = %s)
-                GROUP BY
-                    dv.code,
-                    dv.label,
-                    b.code,
-                    b.title,
-                    p.id,
-                    p.title,
-                    p.normalized_path,
-                    p.source_url,
-                    p.source_metadata,
-                    s.id,
-                    s.stable_id,
-                    s.heading,
-                    s.section_path,
-                    c.id,
-                    c.stable_id,
-                    c.content
+                  AND (
+                      c.search_vector @@ sq.english_query
+                      OR c.simple_search_vector @@ sq.simple_query
+                      OR c.identifier_text %%> ANY(%s::text[])
+                  )
+                ORDER BY
+                    coalesce(ts_rank_cd(c.search_vector, sq.english_query), 0) DESC,
+                    coalesce(ts_rank_cd(c.simple_search_vector, sq.simple_query), 0) DESC,
+                    identifier_rank DESC,
+                    c.id
+                LIMIT %s
+            ),
+            scored AS (
+                SELECT
+                    candidates.*,
+                    coverage.matched_terms,
+                    positions.snippet_match_position,
+                    (
+                        coverage.matched_terms * 100.0
+                        + english_rank * 20.0
+                        + simple_rank * 10.0
+                        + identifier_rank * 5.0
+                    )::float8 AS rank
+                FROM candidates
+                CROSS JOIN LATERAL (
+                    SELECT count(*)::int AS matched_terms
+                    FROM unnest(%s::text[]) AS query_term
+                    WHERE candidates.simple_search_vector
+                        @@ plainto_tsquery('simple', query_term)
+                        OR candidates.identifier_text %%> query_term
+                ) AS coverage
+                CROSS JOIN LATERAL (
+                    SELECT max(NULLIF(strpos(lower(candidates.clean_content), query_term), 0))
+                        AS snippet_match_position
+                    FROM unnest(%s::text[]) AS query_term
+                ) AS positions
+            ),
+            diversified AS (
+                SELECT
+                    scored.*,
+                    row_number() OVER (
+                        PARTITION BY page_id
+                        ORDER BY matched_terms DESC, rank DESC, section_id, chunk_id
+                    ) AS page_rank
+                FROM scored
             )
             SELECT
                 version_code,
@@ -1578,18 +1638,25 @@ class PeopleBooksRepository:
                     ELSE clean_content
                 END AS snippet,
                 rank
-            FROM scored
+            FROM diversified
             WHERE matched_terms >= %s
+              AND page_rank = 1
             ORDER BY matched_terms DESC, rank DESC, page_id, section_id, chunk_id
             LIMIT %s
             """,
             (
-                terms,
+                query,
+                query,
+                identifier_queries,
                 doc_version_id,
                 book_code,
                 book_code,
                 page_id,
                 page_id,
+                identifier_queries,
+                candidate_limit,
+                terms,
+                terms,
                 _minimum_relaxed_matches(len(terms)),
                 max(1, min(limit, 50)),
             ),

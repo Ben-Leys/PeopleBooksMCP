@@ -75,8 +75,7 @@ def test_repository_search_returns_ranked_snippets_and_stable_ids(postgres_url: 
                             stable_id="deleterow-0",
                             ordinal=0,
                             content=(
-                                "DeleteRow removes rows. "
-                                "It mentions array only as unrelated text."
+                                "DeleteRow removes rows. It mentions array only as unrelated text."
                             ),
                             metadata={"kind": "summary"},
                         )
@@ -158,6 +157,18 @@ def test_repository_search_is_scoped_to_doc_version(postgres_url: str) -> None:
 
     assert [result.page_id for result in results] == [first_page.id]
     assert [result.version_code for result in results] == ["pt862"]
+
+
+def test_repository_connection_applies_statement_timeout(postgres_url: str) -> None:
+    run_migrations(postgres_url)
+
+    with PeopleBooksRepository.connect(
+        postgres_url,
+        statement_timeout_seconds=10,
+    ) as repository:
+        row = repository.connection.execute("SHOW statement_timeout").fetchone()
+
+    assert row["statement_timeout"] == "10s"
 
 
 def _queue_indexed_page(

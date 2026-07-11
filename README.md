@@ -28,6 +28,7 @@ Local overrides can be supplied with:
 - `PEOPLEBOOKS_DATABASE_URL`
 - `PEOPLEBOOKS_USER_AGENT`
 - `PEOPLEBOOKS_REQUEST_TIMEOUT_SECONDS`
+- `PEOPLEBOOKS_SEARCH_TIMEOUT_SECONDS`
 
 Example:
 
@@ -36,6 +37,7 @@ Example:
 database_url = "postgresql://peoplebooks:peoplebooks@localhost:5432/peoplebooks"
 user_agent = "PeopleBooksMCP/0.1.0"
 request_timeout_seconds = 20
+search_timeout_seconds = 10
 ```
 
 ## Database

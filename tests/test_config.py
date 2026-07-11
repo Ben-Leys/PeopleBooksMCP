@@ -7,6 +7,7 @@ CONFIG_ENV_VARS = [
     "PEOPLEBOOKS_DATABASE_URL",
     "PEOPLEBOOKS_USER_AGENT",
     "PEOPLEBOOKS_REQUEST_TIMEOUT_SECONDS",
+    "PEOPLEBOOKS_SEARCH_TIMEOUT_SECONDS",
 ]
 
 
@@ -28,6 +29,7 @@ def test_default_config_contains_peopletools_862_peoplecode_seed() -> None:
     assert book.version == "pt862"
     assert book.title == "PeopleCode API Reference"
     assert book.code == "tpcr"
+    assert config.settings.search_timeout_seconds == 10.0
 
 
 def test_config_uses_environment_for_local_database_url(monkeypatch) -> None:
@@ -54,6 +56,7 @@ def test_config_file_overrides_runtime_settings(tmp_path: Path, monkeypatch) -> 
                 'database_url = "postgresql://local/peoplebooks"',
                 'user_agent = "PeopleBooksMCP test"',
                 "request_timeout_seconds = 12.5",
+                "search_timeout_seconds = 7.5",
             ]
         ),
         encoding="utf-8",
@@ -64,6 +67,7 @@ def test_config_file_overrides_runtime_settings(tmp_path: Path, monkeypatch) -> 
     assert config.settings.database_url == "postgresql://local/peoplebooks"
     assert config.settings.user_agent == "PeopleBooksMCP test"
     assert config.settings.request_timeout_seconds == 12.5
+    assert config.settings.search_timeout_seconds == 7.5
 
 
 def test_load_config_discovers_local_peoplebooks_toml(tmp_path: Path, monkeypatch) -> None:

@@ -47,6 +47,10 @@ def test_migrations_create_phase_5_chunk_search_vector_and_index(postgres_url: s
 
     assert "search_vector" in column_names(postgres_url, "chunks")
     assert "ix_chunks_search_vector" in index_names(postgres_url, "chunks")
+    assert "simple_search_vector" in column_names(postgres_url, "chunks")
+    assert "identifier_text" in column_names(postgres_url, "chunks")
+    assert "ix_chunks_simple_search_vector" in index_names(postgres_url, "chunks")
+    assert "ix_chunks_identifier_text_trgm" in index_names(postgres_url, "chunks")
 
 
 def test_fetch_events_are_append_only(postgres_url: str) -> None:

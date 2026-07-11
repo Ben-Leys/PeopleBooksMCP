@@ -1,196 +1,88 @@
-• ## Verdict
+# Current review findings
 
-The project has a strong foundation, but two issues currently prevent it from being genuinely agent-grade at scale:
+Reviewed against the full project and the populated PeopleTools 8.62 database on 2026-07-11.
+The earlier findings for Markdown chunking and continuation, indexed relaxed search, compact MCP
+responses, structured-only compatibility, indexed `find_pages`, shared search timeouts, automatic
+post-parse indexing, explicit lifecycle-state labels, and MCP input schemas have been implemented
+and were removed from this active list.
 
-1. Documentation is not meaningfully chunked, so long sections and formatted code cannot be retrieved correctly.
-2. Relaxed search is too slow for the natural-language questions agents will send.
+## Current verdict
 
-I would fix those before spending more time removing individual JSON fields.
+The normal MCP path is substantially better. The database contains 4,762 indexed pages, 43,798
+sections, and 48,707 chunks. Chunks are capped at 2,000 characters, heading-only sections are
+searchable, section content is losslessly pageable, and ordinary strict searches returned five
+page-diversified results in roughly 0.01-0.05 seconds during this review. A real stdio MCP client
+successfully initialized the server, listed all six tools, and received structured search results.
 
-The current uncommitted MCP reductions are directionally good: removing repeated query/filter/version data, ranks, chunk
-internals, markup, and duplicated automatic text is sensible. I preserved all existing changes and made no
-edits.
+The server is useful now for common lexical searches and exact identifier lookups. It is not yet
+consistently fast or relevant for every natural-language request: the remaining search paths below
+can still take several seconds or hit the configured timeout.
 
-## What is already professional
+## 1. Fix the remaining slow and weak search paths
 
-- Clear separation between ingestion and read-only MCP serving.
-- Raw HTML is retained for reparsing but never exposed to agents.
-- PostgreSQL constraints, composite foreign keys, migrations, atomic fetch events, and parameterized SQL are solid.
-- Search results provide source URLs and page/section handles for drill-down.
-- Compact defaults, response budgets, strict Pydantic output models, and read-only MCP annotations are thoughtful.
-- The real database is healthy: 4,762 indexed pages and 36,718 indexed chunks.
-- All 87 tests pass; linting and compilation pass. Instrumented coverage is approximately 91%.
+`search_docs` strict English FTS is fast, but two paths still need live-sized optimization:
 
-## Highest-priority improvements
+- Relaxed search took 1.6-2.3 seconds for two sampled questions and exceeded 10 seconds for the
+  useful query `What is the difference between CreateArray and CreateArrayRept?`.
+- Exact identifier searches took roughly 0.6-1.1 seconds. This is usable, but slower than necessary
+  because exact search scans chunk content instead of starting from indexed identifier candidates.
 
-### 1. Implement real semantic chunking and lossless retrieval
+Recommended changes:
 
-Every non-empty section currently becomes exactly one chunk in /C:
-/Users/BLeys/PycharmProjects/PeopleBooksMCP/src/peoplebooks_mcp/parser/leaf.py:129. In the live corpus:
+- Inspect `EXPLAIN (ANALYZE, BUFFERS)` for relaxed identifier queries. Avoid an `ANY(...)` or
+  trigram predicate shape that prevents the GIN index from bounding candidates.
+- Add live-sized performance/relevance regression tests for prose questions, camel-case APIs,
+  paired identifiers, no-result queries, and `find_pages`.
 
-- 36,718 non-empty sections each have one chunk.
-- The largest section is 317,112 characters.
-- 7,080 heading-only sections have no searchable chunk.
+## 2. Finish the single-worker ingestion lifecycle
 
-get_section(detail="full") then budgets both the section and its identical chunk /C:
-/Users/BLeys/PycharmProjects/PeopleBooksMCP/src/peoplebooks_mcp/mcp_server.py:827, duplicating content. Its truncator
-also collapses all
-whitespace /C:/Users/BLeys/PycharmProjects/PeopleBooksMCP/src/peoplebooks_mcp/mcp_server.py:1039.
+Concurrent scraper claiming is intentionally out of scope because this deployment will run only one
+scraper. The remaining lifecycle issues still matter with one worker:
 
-In a real 4,914-character example, “full” returned:
+- Failed pages are terminal because the scrape queue only selects `queued` pages and fetched pages
+  awaiting parsing. There is no retry/requeue command for transient failures.
+- `PeopleBooksFetcher.fetch` creates and closes an `httpx.Client` for every URL. Reusing one client
+  for a discovery or scrape run would reuse connections and TLS sessions.
 
-- The same first 4,000 characters twice.
-- None of the original 44 line breaks.
-- No way to retrieve the remainder.
+Recommended changes:
 
-That directly contradicts the documented “exact section text” behavior.
+- Add an explicit `retry-failed`/`requeue-failed` command with bounded retry metadata.
+- Make the fetcher a context-managed run-level client while retaining the existing conservative
+  delay and retry behavior.
 
-Recommended design:
+## 3. Polish the MCP contract
 
-- Convert HTML into compact Markdown preserving code blocks, lists, tables, warnings, and links.
-- Chunk on semantic block boundaries at roughly 1,200–2,000 characters.
-- Keep code/table blocks intact where possible.
-- Give every heading a searchable record, even with no body.
-- Make get_section return one content field, not section content plus chunks.
-- Add an opaque continuation cursor so every section can be retrieved.
-- Preserve section/chunk database IDs through reparsing, or expose a genuinely stable handle.
+- The stdio initialization response reports the MCP SDK version (`1.28.1` during this review) as the
+  PeopleBooks server version. Advertise the project version instead.
+- The six-tool catalog serializes to about 17,086 characters. The tool set is appropriate, but
+  further concise descriptions may make those tokens more useful.
+- Add one automated end-to-end stdio protocol test. Current MCP tests call FastMCP in process; the
+  manual stdio smoke test passed on Windows during this review.
 
-### 2. Replace the relaxed substring scan
+## 4. Configuration, packaging, and operational hardening
 
-The relaxed fallback cross-joins every query term with every chunk and repeatedly evaluates %LIKE% over content /C:
-/Users/BLeys/PycharmProjects/PeopleBooksMCP/src/peoplebooks_mcp/repositories/postgres.py:1412.
+- Documentation versions and the initial `tpcr` seed are still Python constants. TOML currently
+  accepts only `[settings]`, so adding another documentation version is a small code/configuration
+  change rather than a data-only addition.
+- The official MCP Python SDK says packages using stable v1 should add a `<2` upper bound before the
+  stable v2 release. Change the dependency to a tested v1 range such as `mcp>=1.28,<2` and refresh
+  the lockfile.
+- The wheel target includes only `src/peoplebooks_mcp`; Alembic configuration and migrations are not
+  bundled. Either document that the server is repo-operated only or package the migration assets so
+  an installed wheel can initialize its database.
+- MCP annotations describe read-only behavior but do not enforce database permissions. Production
+  MCP processes should use a PostgreSQL role restricted to `SELECT` plus a role-level statement
+  timeout.
+- There is still no CI workflow, license, or security policy. These are release/maintenance items,
+  not blockers for local use.
 
-Live timings for ordinary agent questions were:
+Official SDK guidance: https://github.com/modelcontextprotocol/python-sdk
 
-- 16.3 seconds
-- 21.5 seconds
+## 5. Code hygiene
 
-Strict GIN-backed searches generally took 0.1–0.2 seconds.
-
-Use a GIN-supported OR-style full-text fallback, calculate term coverage over a bounded candidate set, and then rerank.
-For PeopleCode identifiers, combine:
-
-- English FTS for prose.
-- simple FTS or a normalized identifier column.
-- Trigram matching for %This, SQLExec, camel-case APIs, filenames, and headings.
-- Page diversification so five results are not all sections from one page.
-- A database statement_timeout.
-
-Embeddings are not the next priority. API documentation benefits more from good lexical, identifier, and phrase
-retrieval.
-
-### 3. Reduce results structurally, not only field-by-field
-
-The default search returns up to ten results but shares only 450 snippet characters across them. A live CreateArray
-lookup produced:
-
-- 5,266 serialized characters.
-- 450 snippet characters.
-- Approximately 4,816 characters of metadata and JSON structure.
-- An average snippet of only 45 characters.
-
-The generated seven-tool catalog is about 19,126 characters of schemas and descriptions. get_page and get_page_outline
-are behaviorally identical /C:/Users/BLeys/PycharmProjects/PeopleBooksMCP/src/peoplebooks_mcp/mcp_server.py:316,
-duplicating more than 7,000 schema characters between them.
-
-I recommend:
-
-- Default to three results, with one high-quality hit per page.
-- Remove get_page; retain get_page_outline.
-- Flatten search results and remove the now-pointless chunk: {snippet} wrapper.
-- Omit echoed version/input values on successful calls.
-- Return a relative section path without repeating the page title.
-- Measure the complete serialized response, not just body text.
-- Remove or paginate the book-pages resource. The current tpcr pages resource is 297,719 characters for 1,141 pages /C:
-  /Users/BLeys/PycharmProjects/PeopleBooksMCP/src/peoplebooks_mcp/mcp_server.py:551.
-
-A better default result shape would be:
-
-{
-"match": "strict",
-"truncated": false,
-"results": [{
-"page_id": 1826,
-"section_id": 23680,
-"book_code": "tpcl",
-"title": "PeopleCode Built-in Functions and Language Constructs: C",
-"path": ["CreateArray", "Syntax"],
-"snippet": "CreateArray(paramlist) ...",
-"source_url": "https://docs.oracle.com/..."
-}]
-}
-
-### 4. Structured-only output compatibility policy — implemented
-
-Successful tools default to structured-only results to avoid duplicating JSON. Operators can set
-`tool_result_mode = "compatible"` or `PEOPLEBOOKS_TOOL_RESULT_MODE=compatible` for clients that require the structured
-payload serialized into legacy text content. Recoverable tool failures set `isError=true`, include concise recovery
-text and structured error details, and log internal database exceptions without exposing them to clients.
-
-### 5. Fix the ingestion lifecycle
-
-Failed pages are terminal: queue selection only includes queued and fetched-but-unparsed pages /C:
-/Users/BLeys/PycharmProjects/PeopleBooksMCP/src/peoplebooks_mcp/repositories/postgres.py:607. The schema defines
-fetching, but it is
-never used, and pages are not atomically claimed. Two scraper processes could therefore fetch the same pages.
-
-Implement:
-
-- Atomic claiming with FOR UPDATE SKIP LOCKED.
-- A claim timestamp/lease for interrupted workers.
-- Retry scheduling and a retry-failed or requeue command.
-- Persistent HTTP client reuse instead of opening a client/TLS connection for every page.
-- Incremental indexing after parsing so search is never silently stale.
-
-The status output is also misleading. The fully indexed live corpus reports fetched: 0 and parsed: 0 because those are
-treated as mutually exclusive current states /C:/Users/BLeys/PycharmProjects/PeopleBooksMCP/src/peoplebooks_mcp/
-repositories/postgres.py:870. Use cumulative timestamp-based counts or label them explicitly as current states.
-
-## Agent perspective
-
-A typical agent will:
-
-1. Read tool names, descriptions, and input schemas—not the repository README.
-2. Send the user’s full question to search_docs.
-3. Follow a returned section_id into get_section.
-4. Request an outline only when search is ambiguous.
-
-You support that flow partially. The source URL, handles, match mode, compact snippets, and truncation indicator are
-exactly the right ingredients.
-
-What is missing is equally important:
-
-- Natural questions can trigger 20-second searches.
-- Ten default results leave too little useful text per result.
-- search_mode and max_chars have no concise parameter descriptions in the exposed schema.
-- get_page versus get_page_outline is ambiguous.
-- Long sections have no continuation.
-- Code and tables lose formatting.
-- detail="normal" behaves the same as compact.
-- Numeric section IDs change after reparsing because sections are deleted and reinserted /C:
-  /Users/BLeys/PycharmProjects/PeopleBooksMCP/src/peoplebooks_mcp/repositories/postgres.py:1049.
-
-The ideal agent contract is: search once, get three useful candidates, fetch one formatted section, and continue only if
-explicitly indicated.
-
-## Remaining professional polish
-
-- The “new versions are configuration additions” claim is not implemented: versions and books are hard-coded, while TOML
-  only reads [settings] /C:/Users/BLeys/PycharmProjects/PeopleBooksMCP/src/peoplebooks_mcp/config.py:46.
-- docs/IMPLEMENTATION_PLAN.md contains stale phase language and contradicts completed full-tree discovery.
-- mcp>=1.15 needs a <2 upper bound /C:/Users/BLeys/PycharmProjects/PeopleBooksMCP/pyproject.toml:11. The official stable
-  SDK documentation specifically recommends this before v2 lands. Official MCP Python SDK v1 branch
-  (https://github.com/modelcontextprotocol/python-sdk/tree/v1.x)
-
-- The server advertises the MCP SDK version rather than the PeopleBooks server version.
-- The wheel does not bundle Alembic migrations/configuration, so installation is not self-contained.
-- The MCP process should use a dedicated PostgreSQL read-only role plus statement timeouts; annotations alone do not
-  enforce read-only access.
-- mcp_server.py and repositories/postgres.py should be split into catalog, search, ingestion, payload, tool, and
-  resource modules.
-- ruff format --check currently reports seven files needing formatting.
-- There is no CI, license, security policy, contribution guidance, or end-to-end stdio protocol test.
-
-My recommended implementation order is: semantic chunking and paged Markdown retrieval; indexed relaxed search; MCP
-surface simplification and error compatibility; ingestion/configuration robustness; then packaging, CI, and
-documentation polish.
+- `ruff check` and compilation pass, and all 99 tests pass serially.
+- `ruff format --check` still reports three untouched files needing formatting:
+  `config.py`, `repositories/__init__.py`, and `test_config.py`.
+- `mcp_server.py` and `repositories/postgres.py` are large. Splitting them by tool/resource payloads
+  and ingestion/search repositories would improve maintainability, but this is refactoring rather
+  than a current correctness requirement.

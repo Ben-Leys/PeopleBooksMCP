@@ -10,7 +10,7 @@ from typing import Annotated, Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
-from psycopg.errors import UndefinedColumn
+from psycopg.errors import QueryCanceled, UndefinedColumn
 from pydantic import BaseModel, ConfigDict, Field
 
 from peoplebooks_mcp.config import ToolResultMode, load_config
@@ -27,7 +27,6 @@ from peoplebooks_mcp.repositories import (
 
 JsonObject = dict[str, Any]
 logger = logging.getLogger(__name__)
-DetailLevel = Literal["compact", "normal", "full"]
 SearchMode = Literal["auto", "exact"]
 
 DEFAULT_VERSION = "pt862"
@@ -36,6 +35,7 @@ DEFAULT_SEARCH_RESPONSE_CHARS = 4000
 DEFAULT_SECTION_CHARS = 1200
 MAX_RESPONSE_CHARS = 8000
 BOOK_PAGES_RESOURCE_LIMIT = 100
+MIN_STRICT_AUTO_SCORE = 0.2
 
 
 class StrictModel(BaseModel):
@@ -240,6 +240,23 @@ def create_server(
             ),
             is_error=True,
         )
+
+    def search_timeout_result(tool_name: str) -> CallToolResult:
+        logger.warning("MCP tool %s exceeded the configured search timeout", tool_name)
+        error = {
+            "code": "search_timeout",
+            "message": (
+                f"The {tool_name} query exceeded the configured search timeout. "
+                "Narrow the query with book_code or page_id and retry."
+            ),
+        }
+        if tool_name == "search_docs":
+            return tool_result(
+                {"match": "error", "truncated": False, "results": [], "error": error},
+                is_error=True,
+            )
+        return tool_result({"error": error}, is_error=True)
+
     server = FastMCP(
         "peoplebooks-mcp",
         instructions=(
@@ -259,13 +276,39 @@ def create_server(
         structured_output=True,
     )
     def search_docs(
-        query: str,
-        version: str = DEFAULT_VERSION,
-        limit: int = 5,
-        book_code: str | None = None,
-        page_id: int | None = None,
-        search_mode: SearchMode = "auto",
-        max_chars: int = DEFAULT_SEARCH_RESPONSE_CHARS,
+        query: Annotated[str, Field(description="Question, phrase, heading, or API name to find.")],
+        version: Annotated[
+            str, Field(description="Configured documentation version code.")
+        ] = DEFAULT_VERSION,
+        limit: Annotated[int, Field(description="Maximum page-diversified results to return.")] = 5,
+        book_code: Annotated[
+            str | None,
+            Field(description="Optional book code from list_books used to narrow the search."),
+        ] = None,
+        page_id: Annotated[
+            int | None,
+            Field(
+                description="Optional page_id from search_docs or find_pages to search one page."
+            ),
+        ] = None,
+        search_mode: Annotated[
+            SearchMode,
+            Field(
+                description=(
+                    "Use 'exact' for a specific API, page title, or heading; use 'auto' for "
+                    "questions and general searches."
+                )
+            ),
+        ] = "auto",
+        max_chars: Annotated[
+            int,
+            Field(
+                description=(
+                    "Character budget for the complete serialized response, including metadata; "
+                    "results are omitted from the end when the budget is reached."
+                )
+            ),
+        ] = DEFAULT_SEARCH_RESPONSE_CHARS,
     ) -> Annotated[CallToolResult, SearchDocsResponse]:
         """Use first for questions or code checks. Returns compact snippets and stable handles."""
         try:
@@ -296,7 +339,9 @@ def create_server(
                         page_id=page_id,
                     )
                     match_mode = "strict"
-                if search_mode == "auto" and not results:
+                if search_mode == "auto" and (
+                    not results or results[0].rank < MIN_STRICT_AUTO_SCORE
+                ):
                     results = repository.search_chunks_relaxed(
                         doc_version_id=doc_version.id,
                         query=query,
@@ -305,6 +350,8 @@ def create_server(
                         page_id=page_id,
                     )
                     match_mode = "relaxed" if results else "none"
+        except QueryCanceled:
+            return search_timeout_result("search_docs")
         except UndefinedColumn:
             logger.warning("Search schema is missing required columns", exc_info=True)
             return tool_result(
@@ -338,14 +385,24 @@ def create_server(
         structured_output=True,
     )
     def find_pages(
-        query: str,
-        version: str = DEFAULT_VERSION,
-        book_code: str | None = None,
-        limit: int = 10,
+        query: Annotated[
+            str, Field(description="Page title, heading, path fragment, or API name to locate.")
+        ],
+        version: Annotated[
+            str, Field(description="Configured documentation version code.")
+        ] = DEFAULT_VERSION,
+        book_code: Annotated[
+            str | None,
+            Field(description="Optional book code from list_books used to narrow candidates."),
+        ] = None,
+        limit: Annotated[int, Field(description="Maximum page candidates to return.")] = 10,
     ) -> Annotated[CallToolResult, FindPagesResponse]:
         """Use to locate likely pages without spending tokens on section or chunk content."""
         try:
-            with PeopleBooksRepository.connect(resolved_database_url) as repository:
+            with PeopleBooksRepository.connect(
+                resolved_database_url,
+                statement_timeout_seconds=resolved_search_timeout,
+            ) as repository:
                 doc_version = repository.get_doc_version_by_code(version)
                 if doc_version is None:
                     return unknown_version_result(version)
@@ -355,6 +412,8 @@ def create_server(
                     book_code=book_code,
                     limit=_bounded_limit(limit),
                 )
+        except QueryCanceled:
+            return search_timeout_result("find_pages")
         except Exception:
             return database_error_result("find_pages")
         return tool_result(
@@ -368,12 +427,21 @@ def create_server(
         structured_output=True,
     )
     def get_page_outline(
-        version: str = DEFAULT_VERSION,
-        page_id: int | None = None,
-        normalized_path: str | None = None,
-        limit: int = 50,
-        offset: int = 0,
-        max_level: int | None = None,
+        version: Annotated[
+            str, Field(description="Configured documentation version code.")
+        ] = DEFAULT_VERSION,
+        page_id: Annotated[
+            int | None,
+            Field(description="Preferred page_id returned by search_docs or find_pages."),
+        ] = None,
+        normalized_path: Annotated[
+            str | None, Field(description="Exact normalized path when page_id is unavailable.")
+        ] = None,
+        limit: Annotated[int, Field(description="Maximum headings to return.")] = 50,
+        offset: Annotated[int, Field(description="Zero-based heading offset for pagination.")] = 0,
+        max_level: Annotated[
+            int | None, Field(description="Optional deepest heading level to include.")
+        ] = None,
     ) -> Annotated[CallToolResult, PageDetailResponse]:
         """Use before get_section when only headings and section ids are needed."""
         try:
@@ -414,14 +482,36 @@ def create_server(
         structured_output=True,
     )
     def get_section(
-        version: str = DEFAULT_VERSION,
-        section_id: int | None = None,
-        section_stable_id: str | None = None,
-        page_id: int | None = None,
-        normalized_path: str | None = None,
-        detail: DetailLevel = "compact",
-        max_chars: int = DEFAULT_SECTION_CHARS,
-        cursor: str | None = None,
+        version: Annotated[
+            str, Field(description="Configured documentation version code.")
+        ] = DEFAULT_VERSION,
+        section_id: Annotated[
+            int | None,
+            Field(description="Preferred section_id returned by search_docs or get_page_outline."),
+        ] = None,
+        section_stable_id: Annotated[
+            str | None,
+            Field(description="Stable section identifier, used together with a page identifier."),
+        ] = None,
+        page_id: Annotated[
+            int | None, Field(description="Page identifier used to resolve section_stable_id.")
+        ] = None,
+        normalized_path: Annotated[
+            str | None, Field(description="Exact page path used to resolve section_stable_id.")
+        ] = None,
+        max_chars: Annotated[
+            int,
+            Field(description="Character budget for Markdown content only, excluding metadata."),
+        ] = DEFAULT_SECTION_CHARS,
+        cursor: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Opaque next_cursor from the preceding response; reuse it unchanged with the "
+                    "same section identifier to continue without gaps or duplication."
+                )
+            ),
+        ] = None,
     ) -> Annotated[CallToolResult, SectionDetailResponse]:
         """Use after search_docs or get_page_outline. Returns paged Markdown without duplication."""
         try:
@@ -454,7 +544,6 @@ def create_server(
                         _section_detail_payload(
                             repository,
                             section,
-                            detail=detail,
                             max_chars=max_chars,
                             cursor=cursor,
                         )
@@ -471,7 +560,11 @@ def create_server(
         annotations=read_only,
         structured_output=True,
     )
-    def list_books(version: str = DEFAULT_VERSION) -> Annotated[CallToolResult, ListBooksResponse]:
+    def list_books(
+        version: Annotated[
+            str, Field(description="Configured documentation version code.")
+        ] = DEFAULT_VERSION,
+    ) -> Annotated[CallToolResult, ListBooksResponse]:
         """List book codes for scoping later search_docs or find_pages calls."""
         try:
             with PeopleBooksRepository.connect(resolved_database_url) as repository:
@@ -492,7 +585,11 @@ def create_server(
         annotations=read_only,
         structured_output=True,
     )
-    def health(version: str = DEFAULT_VERSION) -> Annotated[CallToolResult, JsonObject]:
+    def health(
+        version: Annotated[
+            str, Field(description="Configured documentation version code to check for readiness.")
+        ] = DEFAULT_VERSION,
+    ) -> Annotated[CallToolResult, JsonObject]:
         """Report schema and index readiness for agent querying."""
         try:
             with PeopleBooksRepository.connect(resolved_database_url) as repository:
@@ -651,7 +748,6 @@ def create_server(
                 _section_detail_payload(
                     repository,
                     section,
-                    detail="compact",
                     max_chars=DEFAULT_SECTION_CHARS,
                     cursor=None,
                 )
@@ -885,7 +981,6 @@ def _section_detail_payload(
     repository: PeopleBooksRepository,
     section: SectionRecord,
     *,
-    detail: DetailLevel,
     max_chars: int,
     cursor: str | None,
 ) -> JsonObject:
@@ -893,7 +988,6 @@ def _section_detail_payload(
     version = _require_doc_version_by_id(repository, page.doc_version_id)
     book = _require_book_by_id(repository, page.book_id)
     bounded_max_chars = _bounded_max_chars(max_chars, default=DEFAULT_SECTION_CHARS)
-    del detail  # Retained as a compatibility input; all levels now use lossless paging.
     offset = _decode_section_cursor(cursor, section=section) if cursor else 0
     content, next_offset = _section_content_page(
         section.content,

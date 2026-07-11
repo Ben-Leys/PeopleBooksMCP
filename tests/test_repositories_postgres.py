@@ -249,6 +249,11 @@ def test_repository_replaces_parsed_sections_and_chunks(postgres_url: str) -> No
 
         sections = repository.list_sections_for_page(page_id=page.id)
         chunks = repository.list_chunks_for_page(page_id=page.id)
+        indexed_page = repository.get_page_by_id(page.id)
+        indexed_chunk = repository.connection.execute(
+            "SELECT search_vector, simple_search_vector, identifier_text FROM chunks WHERE id = %s",
+            (chunks[0].id,),
+        ).fetchone()
 
         assert len(sections) == 1
         assert sections[0].id == original_section.id
@@ -256,6 +261,11 @@ def test_repository_replaces_parsed_sections_and_chunks(postgres_url: str) -> No
         assert sections[0].content == "CreateArray returns an array object."
         assert [chunk.stable_id for chunk in chunks] == ["createarray-0", "createarray-1"]
         assert chunks[0].id == original_chunk.id
+        assert indexed_page is not None
+        assert indexed_page.fetch_status == "indexed"
+        assert indexed_chunk["search_vector"] is not None
+        assert indexed_chunk["simple_search_vector"] is not None
+        assert "peoplecode api reference" in indexed_chunk["identifier_text"]
 
         repository.replace_page_sections(
             page_id=page.id,

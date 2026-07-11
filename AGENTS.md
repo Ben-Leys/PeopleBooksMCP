@@ -12,8 +12,9 @@
 - Scrapes Oracle PeopleBooks into PostgreSQL and exposes the content through MCP.
 - Seed source: Oracle PeopleSoft PeopleTools 8.62.
 - Seed URL: `https://docs.oracle.com/cd/G41075_01/pt862pbr3/eng/pt/index.html?focusnode=home`.
-- Initial book: PeopleCode API Reference (`tpcr`).
-- New PeopleBooks versions are config/data additions, not rewrites.
+- Initial configured book seed: PeopleCode API Reference (`tpcr`).
+- Full-tree discovery adds books from Oracle data; new documentation-version seeds currently require
+  an entry in `peoplebooks_mcp.config`.
 
 ## Stack
 
@@ -43,8 +44,9 @@
 - Store raw HTML, normalized URL, source metadata, content hash, parser version, fetch status, timestamps, and append-only fetch diagnostics.
 - Parse leaf pages into H1/H2/H3 Markdown sections and roughly 1,200-2,000-character semantic chunks.
 - Preserve code blocks, lists, tables, warnings, and links; heading-only sections receive searchable chunks.
-- Store English and simple chunk vectors with GIN indexes; trigram-index compact identifier metadata.
-- `peoplebooks_mcp.indexing.index_pages` refreshes chunk vectors and marks pages indexed.
+- Successful parsing refreshes that page's vectors and marks it indexed in the same transaction.
+- Store English and simple chunk vectors with GIN indexes; trigram identifier metadata covers book/page titles, paths, and headings.
+- `peoplebooks_mcp.indexing.index_pages` remains available for bulk vector refreshes.
 - Repository entry point: `peoplebooks_mcp.repositories.PeopleBooksRepository`.
 - Repository search returns version, book, page, section path, source URL, snippets, rank, and stable section/chunk IDs.
 
@@ -57,7 +59,8 @@
 - `peoplebooks reparse --version pt862 --parser-version X`
 - `peoplebooks index --version pt862`
 - `peoplebooks serve-mcp`
-- `discover` and `scrape` print updating progress counters; `status` prints discovered, queued, fetched, failed, parsed, and indexed counts.
+- `discover` and `scrape` print updating progress counters; `status` labels its total separately from
+  mutually exclusive current lifecycle states.
 - `serve-mcp` starts the read-only MCP server over stdio.
 
 ## MCP
@@ -74,11 +77,13 @@
 - Search results are flat and include `book_code`, `page_id`, title, `section_id`, relative path, source URL, and snippet.
 - Prefer `search_docs` or `find_pages`, then returned `page_id`/`section_id`, instead of guessing page paths.
 - Use `search_docs(search_mode="exact")` for specific API, page, or heading lookups.
-- `search_docs` uses strict English FTS first, then bounded OR-style English/simple FTS plus trigram reranking and page diversification.
-- `search_docs` database work has a configurable 10-second default statement timeout.
+- `search_docs` keeps strong strict English FTS results and falls back below a minimum strict score to bounded English/simple FTS plus identifier reranking.
+- `find_pages` ranks indexed book/page title, path, and heading metadata without scanning chunk bodies.
+- `search_docs` and `find_pages` share a configurable 10-second default statement timeout and return `search_timeout` when it expires.
 - Use `get_page_outline` for paged headings before requesting body text with `get_section`.
 - `search_docs.max_chars` budgets its complete serialized response; `get_section.max_chars` budgets content.
 - `get_section` returns one Markdown `content` field and an opaque `next_cursor` for lossless continuation.
+- MCP input schemas describe parameter use, response budgets, and opaque cursor reuse.
 - Book-page resources return at most 100 pages plus a `next_uri` continuation.
 - `health` reports schema revision, required search columns, and parsed/indexed content readiness.
 

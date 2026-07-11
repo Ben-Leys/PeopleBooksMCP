@@ -181,8 +181,10 @@ def test_status_command_prints_lifecycle_counts(monkeypatch) -> None:
     result = CliRunner().invoke(app, ["status"])
 
     assert result.exit_code == 0
-    assert "discovered: 4" in result.output
-    assert "queued: 1" in result.output
+    assert "total discovered pages: 4" in result.output
+    assert "current lifecycle states:" in result.output
+    assert "fetched, awaiting parse: 1" in result.output
+    assert "parsed, awaiting index: 1" in result.output
     assert "indexed: 0" in result.output
 
 

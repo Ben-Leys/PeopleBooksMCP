@@ -178,12 +178,13 @@ def status(
             raise typer.Exit(code=2)
         counts = repository.get_status_counts(doc_version_id=doc_version.id)
 
-    typer.echo(f"discovered: {counts.discovered}")
-    typer.echo(f"queued: {counts.queued}")
-    typer.echo(f"fetched: {counts.fetched}")
-    typer.echo(f"failed: {counts.failed}")
-    typer.echo(f"parsed: {counts.parsed}")
-    typer.echo(f"indexed: {counts.indexed}")
+    typer.echo(f"total discovered pages: {counts.discovered}")
+    typer.echo("current lifecycle states:")
+    typer.echo(f"  queued: {counts.queued}")
+    typer.echo(f"  fetched, awaiting parse: {counts.fetched}")
+    typer.echo(f"  failed: {counts.failed}")
+    typer.echo(f"  parsed, awaiting index: {counts.parsed}")
+    typer.echo(f"  indexed: {counts.indexed}")
 
 
 @app.command()

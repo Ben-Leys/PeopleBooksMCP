@@ -1,4 +1,7 @@
-# PeopleBooks MCP Implementation Plan
+# PeopleBooks MCP Implementation Plan (Archived)
+
+This file records the original phased implementation plan. It is retained for history and is not
+current project guidance; use `README.md` and `AGENTS.md` for the implemented behavior.
 
 **Goal:** Build a working Python 3.14 service that scrapes Oracle PeopleBooks into PostgreSQL and exposes indexed
 documentation through read-only MCP tools/resources.

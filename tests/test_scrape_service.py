@@ -159,7 +159,8 @@ def test_scrape_pages_obeys_limit_and_resumes_from_remaining_queue(postgres_url:
     assert first_result.parsed == 2
     assert second_result.scraped == 1
     assert counts.queued == 0
-    assert counts.parsed == 3
+    assert counts.parsed == 0
+    assert counts.indexed == 3
     assert fetcher.calls == page_urls
 
 
@@ -195,7 +196,8 @@ def test_scrape_pages_resumes_fetched_unparsed_pages_without_refetching(
     assert result.failed == 0
     assert result.parsed == 1
     assert counts.fetched == 0
-    assert counts.parsed == 1
+    assert counts.parsed == 0
+    assert counts.indexed == 1
     assert fetcher.calls == []
     assert sections[0].heading == "Fetched Before Crash"
 
@@ -235,8 +237,9 @@ def test_scrape_pages_records_failed_fetch_and_continues(postgres_url: str) -> N
     assert result.failed == 1
     assert result.parsed == 1
     assert counts.failed == 1
-    assert counts.parsed == 1
-    assert [row["fetch_status"] for row in rows] == ["failed", "parsed"]
+    assert counts.parsed == 0
+    assert counts.indexed == 1
+    assert [row["fetch_status"] for row in rows] == ["failed", "indexed"]
     assert failed_events[0].fetch_status == "failed"
     assert failed_events[0].status_code == 503
     assert success_events[0].fetch_status == "fetched"
@@ -273,7 +276,8 @@ def test_reparse_pages_rebuilds_sections_from_raw_html_without_fetching(
         counts = repository.get_status_counts(doc_version_id=version_id)
 
     assert result.reparsed == 1
-    assert counts.parsed == 1
+    assert counts.parsed == 0
+    assert counts.indexed == 1
     assert sections[0].heading == "Fresh Heading"
     assert sections[0].content == "Fresh parsed body."
     assert sections[0].parser_version == "parser-v2"

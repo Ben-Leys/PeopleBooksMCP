@@ -5,6 +5,8 @@ import json
 from collections.abc import Awaitable
 from typing import Any
 
+from psycopg.errors import QueryCanceled
+
 import peoplebooks_mcp.mcp_server as mcp_server_module
 from peoplebooks_mcp.database import run_migrations
 from peoplebooks_mcp.indexing import index_pages
@@ -85,9 +87,7 @@ def test_mcp_compatible_mode_serializes_structured_content_as_text(
     _seed_indexed_docs(postgres_url)
     server = create_server(database_url=postgres_url, tool_result_mode="compatible")
 
-    result = _run(
-        server.call_tool("search_docs", {"version": "pt862", "query": "array object"})
-    )
+    result = _run(server.call_tool("search_docs", {"version": "pt862", "query": "array object"}))
 
     assert not result.isError
     assert len(result.content) == 1
@@ -129,6 +129,27 @@ def test_mcp_internal_database_errors_are_logged_and_sanitized(monkeypatch) -> N
     assert secret not in json.dumps(result.structuredContent)
     assert secret not in result.content[0].text
     assert logged
+
+
+def test_mcp_search_tools_return_specific_timeout_errors(monkeypatch) -> None:
+    def fail_connect(*args, **kwargs):
+        del args, kwargs
+        raise QueryCanceled("statement timeout")
+
+    monkeypatch.setattr(mcp_server_module.PeopleBooksRepository, "connect", fail_connect)
+    server = create_server(
+        database_url="postgresql://example/unused",
+        search_timeout_seconds=0.001,
+    )
+
+    search_result = _run(server.call_tool("search_docs", {"query": "CreateArray"}))
+    find_result = _run(server.call_tool("find_pages", {"query": "CreateArray"}))
+
+    assert search_result.isError
+    assert search_result.structuredContent["error"]["code"] == "search_timeout"
+    assert search_result.structuredContent["match"] == "error"
+    assert find_result.isError
+    assert find_result.structuredContent["error"]["code"] == "search_timeout"
 
 
 def test_mcp_search_docs_returns_lean_markup_free_results(postgres_url: str) -> None:
@@ -261,7 +282,6 @@ def test_mcp_get_section_returns_lossless_pages_with_an_opaque_cursor(
         {
             "version": "pt862",
             "section_id": ids["section_id"],
-            "detail": "full",
             "max_chars": 500,
         },
     )
@@ -388,6 +408,17 @@ def test_mcp_find_pages_returns_bounded_thin_candidates(postgres_url: str) -> No
     assert "sections" not in result["pages"][0]
     assert "chunks" not in result["pages"][0]
     assert "content" not in result["pages"][0]
+
+    body_only_result = _call_tool(
+        server,
+        "find_pages",
+        {
+            "version": "pt862",
+            "query": "precise retrieval target",
+            "book_code": "tape",
+        },
+    )
+    assert body_only_result == {"pages": []}
 
 
 def test_mcp_get_page_outline_returns_headings_without_content(postgres_url: str) -> None:
@@ -733,6 +764,22 @@ def test_mcp_tool_metadata_has_specific_output_schemas_and_workflow_descriptions
     assert "get_page" not in tools
     assert tools["get_page_outline"].outputSchema.get("additionalProperties") is not True
     assert tools["search_docs"].inputSchema["properties"]["limit"]["default"] == 5
+    assert (
+        "specific API"
+        in tools["search_docs"].inputSchema["properties"]["search_mode"]["description"]
+    )
+    assert (
+        "complete serialized response"
+        in tools["search_docs"].inputSchema["properties"]["max_chars"]["description"]
+    )
+    assert (
+        "content only" in tools["get_section"].inputSchema["properties"]["max_chars"]["description"]
+    )
+    assert (
+        "reuse it unchanged"
+        in tools["get_section"].inputSchema["properties"]["cursor"]["description"]
+    )
+    assert "detail" not in tools["get_section"].inputSchema["properties"]
     assert "Use first for questions" in tools["search_docs"].description
     assert "Use after search_docs or get_page_outline" in tools["get_section"].description
 
@@ -1301,6 +1348,27 @@ def _seed_agent_workflow_docs(database_url: str, *, index: bool = True) -> dict[
         )
         if index:
             index_pages(repository=repository, version_code="pt862")
+        else:
+            repository.connection.execute(
+                """
+                UPDATE chunks
+                SET search_vector = NULL,
+                    simple_search_vector = NULL,
+                    identifier_text = NULL
+                WHERE page_id IN (
+                    SELECT id FROM pages WHERE doc_version_id = %s
+                )
+                """,
+                (version.id,),
+            )
+            repository.connection.execute(
+                """
+                UPDATE pages
+                SET fetch_status = 'parsed', indexed_at = NULL
+                WHERE doc_version_id = %s
+                """,
+                (version.id,),
+            )
 
     return {
         "overview_page_id": overview_page.id,

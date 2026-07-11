@@ -715,10 +715,32 @@ class PeopleBooksRepository:
             ).fetchall()
             return [_record(PageSearchRecord, row) for row in rows]
 
+        candidate_limit = max(100, min(1000, bounded_limit * 25))
         rows = self._connection.execute(
             """
-            WITH query_terms AS (
-                SELECT unnest(%s::text[]) AS term
+            WITH candidates AS MATERIALIZED (
+                SELECT
+                    query_term.term,
+                    candidate.page_id,
+                    candidate.identifier_rank
+                FROM unnest(%s::text[]) AS query_term(term)
+                CROSS JOIN LATERAL (
+                    SELECT
+                        c.page_id,
+                        word_similarity(query_term.term, c.identifier_text)::float8
+                            AS identifier_rank
+                    FROM chunks AS c
+                    JOIN pages AS candidate_page ON candidate_page.id = c.page_id
+                    JOIN books AS candidate_book ON candidate_book.id = candidate_page.book_id
+                    WHERE candidate_page.doc_version_id = %s
+                      AND candidate_page.fetch_status = 'indexed'
+                      AND (%s::text IS NULL OR candidate_book.code = %s)
+                      AND c.identifier_text %%> query_term.term
+                    ORDER BY
+                        word_similarity(query_term.term, c.identifier_text) DESC,
+                        c.id
+                    LIMIT %s
+                ) AS candidate
             ),
             scored AS (
                 SELECT
@@ -731,45 +753,20 @@ class PeopleBooksRepository:
                     p.normalized_path,
                     p.source_url,
                     p.fetch_status,
-                    count(DISTINCT qt.term) FILTER (
-                        WHERE lower(
-                            coalesce(b.title, '') || ' ' ||
-                            coalesce(p.title, '') || ' ' ||
-                            coalesce(array_to_string(s.section_path, ' '), '') || ' ' ||
-                            coalesce(s.heading, '') || ' ' ||
-                            coalesce(c.content, '') || ' ' ||
-                            coalesce(p.normalized_path, '')
-                        ) LIKE ('%%' || qt.term || '%%')
-                    )::int AS matched_terms,
+                    count(DISTINCT candidates.term)::int AS matched_terms,
                     (
-                        count(DISTINCT qt.term) FILTER (
-                            WHERE lower(coalesce(b.title, '')) LIKE ('%%' || qt.term || '%%')
-                        ) * 1.0
-                        + count(DISTINCT qt.term) FILTER (
-                            WHERE lower(coalesce(p.title, '')) LIKE ('%%' || qt.term || '%%')
-                        ) * 2.0
-                        + count(DISTINCT qt.term) FILTER (
-                            WHERE lower(
-                                coalesce(array_to_string(s.section_path, ' '), '') || ' ' ||
-                                coalesce(s.heading, '')
-                            ) LIKE ('%%' || qt.term || '%%')
-                        ) * 2.0
-                        + count(DISTINCT qt.term) FILTER (
-                            WHERE lower(coalesce(c.content, '')) LIKE ('%%' || qt.term || '%%')
-                        ) * 10.0
-                        + count(DISTINCT qt.term) FILTER (
-                            WHERE lower(coalesce(p.normalized_path, '')) LIKE (
-                                '%%' || qt.term || '%%'
-                            )
-                        ) * 0.5
+                        count(DISTINCT candidates.term) * 100.0
+                        + max(candidates.identifier_rank) * 10.0
+                        + CASE
+                            WHEN lower(coalesce(p.title, '')) = lower(%s) THEN 50.0
+                            ELSE 0.0
+                          END
                     )::float8 AS score
-                FROM pages AS p
+                FROM candidates
+                JOIN pages AS p ON p.id = candidates.page_id
                 JOIN books AS b ON b.id = p.book_id
-                LEFT JOIN sections AS s ON s.page_id = p.id
-                LEFT JOIN chunks AS c ON c.section_id = s.id
-                CROSS JOIN query_terms AS qt
                 WHERE p.doc_version_id = %s
-                  AND p.fetch_status IN ('parsed', 'indexed')
+                  AND p.fetch_status = 'indexed'
                   AND (%s::text IS NULL OR b.code = %s)
                 GROUP BY
                     p.id,
@@ -784,11 +781,21 @@ class PeopleBooksRepository:
             )
             SELECT *
             FROM scored
-            WHERE matched_terms > 0
             ORDER BY matched_terms DESC, score DESC, id
             LIMIT %s
             """,
-            (terms, doc_version_id, book_code, book_code, bounded_limit),
+            (
+                terms,
+                doc_version_id,
+                book_code,
+                book_code,
+                candidate_limit,
+                query.strip(),
+                doc_version_id,
+                book_code,
+                book_code,
+                bounded_limit,
+            ),
         ).fetchall()
         return [_record(PageSearchRecord, row) for row in rows]
 
@@ -1198,6 +1205,8 @@ class PeopleBooksRepository:
                 """,
                 (parser_version, page_id),
             )
+            self.refresh_page_search_vectors(page_id=page_id)
+            self.mark_page_indexed(page_id=page_id)
 
     def list_sections_for_page(self, *, page_id: int) -> list[SectionRecord]:
         rows = self._connection.execute(
@@ -1282,6 +1291,7 @@ class PeopleBooksRepository:
                 identifier_text = lower(
                     concat_ws(
                         ' ',
+                        b.title,
                         p.title,
                         p.normalized_path,
                         array_to_string(s.section_path, ' '),
@@ -1289,14 +1299,77 @@ class PeopleBooksRepository:
                     )
                 ),
                 updated_at = now()
-            FROM pages AS p, sections AS s
+            FROM pages AS p, sections AS s, books AS b
             WHERE c.page_id = p.id
               AND c.section_id = s.id
+              AND p.book_id = b.id
               AND p.doc_version_id = %s
             """,
             (doc_version_id,),
         )
         return cursor.rowcount
+
+    def refresh_page_search_vectors(self, *, page_id: int) -> int:
+        cursor = self._connection.execute(
+            """
+            UPDATE chunks AS c
+            SET search_vector =
+                    setweight(to_tsvector('english', coalesce(p.title, '')), 'A')
+                    || setweight(
+                        to_tsvector('english', coalesce(array_to_string(s.section_path, ' '), '')),
+                        'A'
+                    )
+                    || setweight(to_tsvector('english', coalesce(s.heading, '')), 'A')
+                    || setweight(to_tsvector('english', coalesce(c.content, '')), 'B'),
+                simple_search_vector =
+                    setweight(to_tsvector('simple', coalesce(p.title, '')), 'A')
+                    || setweight(
+                        to_tsvector('simple', coalesce(array_to_string(s.section_path, ' '), '')),
+                        'A'
+                    )
+                    || setweight(to_tsvector('simple', coalesce(s.heading, '')), 'A')
+                    || setweight(to_tsvector('simple', coalesce(c.content, '')), 'B'),
+                identifier_text = lower(
+                    concat_ws(
+                        ' ',
+                        b.title,
+                        p.title,
+                        p.normalized_path,
+                        array_to_string(s.section_path, ' '),
+                        s.heading
+                    )
+                ),
+                updated_at = now()
+            FROM pages AS p, sections AS s, books AS b
+            WHERE c.page_id = p.id
+              AND c.section_id = s.id
+              AND p.book_id = b.id
+              AND p.id = %s
+            """,
+            (page_id,),
+        )
+        return cursor.rowcount
+
+    def mark_page_indexed(self, *, page_id: int) -> bool:
+        row = self._connection.execute(
+            """
+            UPDATE pages AS p
+            SET fetch_status = 'indexed',
+                indexed_at = now(),
+                updated_at = now()
+            WHERE p.id = %s
+              AND p.fetch_status IN ('parsed', 'indexed')
+              AND EXISTS (
+                SELECT 1
+                FROM chunks AS c
+                WHERE c.page_id = p.id
+                  AND c.search_vector IS NOT NULL
+              )
+            RETURNING p.id
+            """,
+            (page_id,),
+        ).fetchone()
+        return row is not None
 
     def mark_pages_indexed(self, *, doc_version_id: int) -> int:
         cursor = self._connection.execute(

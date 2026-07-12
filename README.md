@@ -136,14 +136,18 @@ Example MCP client command configuration:
 
 Use the smallest useful result first:
 
-1. `health` checks database, schema, parse, and index readiness.
-2. `list_books` finds book codes for scoping searches.
-3. `search_docs` answers most questions with compact plain-text snippets and
+1. `search_docs` answers questions with compact plain-text snippets and
    `page_id`/`section_id` handles.
+2. Answer directly from those snippets when they contain enough context.
+3. `get_section` retrieves more Markdown only when a returned snippet is insufficient; pass its
+   returned `section_id` unchanged.
 4. `find_pages` locates likely pages from indexed book/page titles, paths, and headings without
    scanning or returning body content.
 5. `get_page_outline` returns paged headings for one page.
-6. `get_section` returns one Markdown `content` page. If `next_cursor` is present,
+6. `health` diagnoses database/index readiness, and `list_books` supplies book codes only when a
+   search genuinely needs scoping.
+
+`get_section` returns one Markdown `content` page. If `next_cursor` is present,
    pass it back with the same section handle to retrieve the lossless continuation.
 
 Successful tool calls default to `tool_result_mode = "structured"`: data is returned in

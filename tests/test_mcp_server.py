@@ -781,7 +781,23 @@ def test_mcp_tool_metadata_has_specific_output_schemas_and_workflow_descriptions
     )
     assert "detail" not in tools["get_section"].inputSchema["properties"]
     assert "Use first for questions" in tools["search_docs"].description
+    assert "Navigation only" in tools["find_pages"].description
     assert "Use after search_docs or get_page_outline" in tools["get_section"].description
+
+
+def test_mcp_latest_alias_uses_default_documentation_version(postgres_url: str) -> None:
+    run_migrations(postgres_url)
+    _seed_indexed_docs(postgres_url)
+    server = create_server(database_url=postgres_url)
+
+    result = _call_tool(
+        server,
+        "list_books",
+        {"version": "latest"},
+    )
+
+    assert result["version"]["code"] == "pt862"
+    assert result["books"]
 
 
 def _run[T](awaitable: Awaitable[T]) -> T:

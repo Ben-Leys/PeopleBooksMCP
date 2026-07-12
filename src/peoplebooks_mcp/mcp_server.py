@@ -228,6 +228,15 @@ def create_server(
             is_error=True,
         )
 
+    def resolve_doc_version(
+        repository: PeopleBooksRepository,
+        version: str,
+    ) -> DocVersionRecord | None:
+        # Agents commonly spell the default version as "latest". Treat it as an
+        # alias rather than spending a failed call teaching them the seed code.
+        version_code = DEFAULT_VERSION if version.strip().lower() == "latest" else version
+        return repository.get_doc_version_by_code(version_code)
+
     def database_error_result(tool_name: str) -> CallToolResult:
         logger.exception("MCP tool %s failed due to an internal database error", tool_name)
         return tool_result(
@@ -261,7 +270,12 @@ def create_server(
         "peoplebooks-mcp",
         instructions=(
             "Read-only Oracle PeopleBooks documentation server backed by local PostgreSQL. "
-            "Handlers search and read indexed database content only."
+            "Handlers search and read indexed database content only. For documentation "
+            "questions, call search_docs first with the user's wording and answer from its "
+            "snippets when sufficient; omit version to use the default. Do not call health, "
+            "list_books, or find_pages first. Use find_pages only to locate a page when no "
+            "answer text is needed. Use get_section only when a search_docs snippet lacks "
+            "enough context, passing the returned section_id unchanged."
         ),
     )
     read_only = ToolAnnotations(
@@ -316,7 +330,7 @@ def create_server(
                 resolved_database_url,
                 statement_timeout_seconds=resolved_search_timeout,
             ) as repository:
-                doc_version = repository.get_doc_version_by_code(version)
+                doc_version = resolve_doc_version(repository, version)
                 if doc_version is None:
                     return unknown_version_result(version)
                 bounded_limit = _bounded_limit(limit)
@@ -389,7 +403,8 @@ def create_server(
             str, Field(description="Page title, heading, path fragment, or API name to locate.")
         ],
         version: Annotated[
-            str, Field(description="Configured documentation version code.")
+            str,
+            Field(description="Configured version code; omit for pt862. 'latest' is accepted."),
         ] = DEFAULT_VERSION,
         book_code: Annotated[
             str | None,
@@ -397,13 +412,13 @@ def create_server(
         ] = None,
         limit: Annotated[int, Field(description="Maximum page candidates to return.")] = 10,
     ) -> Annotated[CallToolResult, FindPagesResponse]:
-        """Use to locate likely pages without spending tokens on section or chunk content."""
+        """Navigation only, not for answering questions. Returns no documentation content."""
         try:
             with PeopleBooksRepository.connect(
                 resolved_database_url,
                 statement_timeout_seconds=resolved_search_timeout,
             ) as repository:
-                doc_version = repository.get_doc_version_by_code(version)
+                doc_version = resolve_doc_version(repository, version)
                 if doc_version is None:
                     return unknown_version_result(version)
                 pages = repository.find_pages(
@@ -446,7 +461,7 @@ def create_server(
         """Use before get_section when only headings and section ids are needed."""
         try:
             with PeopleBooksRepository.connect(resolved_database_url) as repository:
-                doc_version = repository.get_doc_version_by_code(version)
+                doc_version = resolve_doc_version(repository, version)
                 if doc_version is None:
                     return unknown_version_result(version)
                 page = _resolve_page_or_none(
@@ -516,7 +531,7 @@ def create_server(
         """Use after search_docs or get_page_outline. Returns paged Markdown without duplication."""
         try:
             with PeopleBooksRepository.connect(resolved_database_url) as repository:
-                doc_version = repository.get_doc_version_by_code(version)
+                doc_version = resolve_doc_version(repository, version)
                 if doc_version is None:
                     return unknown_version_result(version)
                 try:
@@ -568,7 +583,7 @@ def create_server(
         """List book codes for scoping later search_docs or find_pages calls."""
         try:
             with PeopleBooksRepository.connect(resolved_database_url) as repository:
-                doc_version = repository.get_doc_version_by_code(version)
+                doc_version = resolve_doc_version(repository, version)
                 if doc_version is None:
                     return unknown_version_result(version)
                 books = repository.list_books(doc_version_id=doc_version.id)
@@ -596,7 +611,7 @@ def create_server(
                 schema_revision = repository.get_schema_revision()
                 missing_columns = repository.list_missing_required_columns()
                 schema_is_current = schema_revision == EXPECTED_SCHEMA_REVISION
-                doc_version = repository.get_doc_version_by_code(version)
+                doc_version = resolve_doc_version(repository, version)
                 content = None
                 if doc_version is not None:
                     content_record = repository.get_content_health(

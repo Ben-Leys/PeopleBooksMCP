@@ -74,6 +74,9 @@
 - Results are retrieval-oriented, compact by default, and omit raw HTML plus crawler/debug fields.
 - Search snippets are plain text without highlight markup.
 - Search defaults to five results with at most one result per page.
+- The version value `latest` aliases the default `pt862` documentation version.
+- For questions, call `search_docs` directly; do not preflight with `health`, `list_books`, or `find_pages`.
+- `find_pages` is navigation-only and returns no answer text.
 - Search results are flat and include `book_code`, `page_id`, title, `section_id`, relative path, source URL, and snippet.
 - Prefer `search_docs` or `find_pages`, then returned `page_id`/`section_id`, instead of guessing page paths.
 - Use `search_docs(search_mode="exact")` for specific API, page, or heading lookups.

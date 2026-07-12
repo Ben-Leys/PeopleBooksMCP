@@ -1430,7 +1430,8 @@ class PeopleBooksRepository:
                         'english',
                         c.content,
                         search_query.query,
-                        'StartSel=<mark>, StopSel=</mark>, MaxWords=35, MinWords=8, ShortWord=3'
+                        'StartSel=<mark>, StopSel=</mark>, MaxWords=70, MinWords=30, '
+                        'ShortWord=3, MaxFragments=1'
                     ) AS snippet,
                     ts_rank_cd(c.search_vector, search_query.query)::float8 AS rank,
                     row_number() OVER (
